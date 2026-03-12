@@ -46,8 +46,11 @@ clawmonitor nudge --session-key 'agent:main:main' --template progress
 clawmonitor nudge --session-key 'agent:main:main' --template continue
 clawmonitor push --session-key 'agent:main:main' --dry-run
 clawmonitor status
+clawmonitor status --detail
 clawmonitor status --format json
 clawmonitor status --format md
+clawmonitor status --format md --detail
+clawmonitor tree
 clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
 ```
@@ -99,3 +102,5 @@ ClawMonitor 会做提示：
 如果配置文件不存在，`clawmonitor tui/status/watch/...` 在交互式终端下会提示你运行初始化向导（非交互环境不会卡住）。
 
 更多介绍见：`docs/launch-post.md`。
+
+ClawHub 导入说明见：`docs/clawhub-skill.md`（对应 skill：`skills/claw-monitor/SKILL.md`）。
