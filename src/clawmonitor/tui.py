@@ -457,6 +457,66 @@ class ClawMonitorTUI:
             elif ch in (10, 13):
                 return items[idx]
 
+    def _help_overlay(self, stdscr: "curses._CursesWindow") -> None:
+        lines = [
+            "ClawMonitor TUI Help",
+            "",
+            "Navigation:",
+            "  ↑/↓ (or k/j)   Select session",
+            "  q or Esc       Quit",
+            "",
+            "Actions:",
+            "  r              Refresh now",
+            "  f              Cycle refresh interval (up to 10 minutes)",
+            "  Enter          Send nudge (chat.send) using a template",
+            "  e              Export redacted report (JSON+MD)",
+            "  l              Toggle related logs panel",
+            "  d              Re-run diagnosis (forces refresh)",
+            "",
+            "Health labels (FLAGS column):",
+            "  OK     Normal / completed",
+            "  RUN    Working (lock present)",
+            "  IDLE   No user message seen",
+            "  ALERT  Abnormal (NOFB / delivery failure / safety / safeguard off / interrupted)",
+            "",
+            "Notes:",
+            "  - Related Logs require Gateway logs.tail (online mode).",
+            "  - Reports/logs are redacted, but review before sharing.",
+            "",
+            "Press any key to close.",
+        ]
+
+        h, w = stdscr.getmaxyx()
+        win_h = min(max(12, len(lines) + 2), max(6, h - 4))
+        win_w = min(92, max(20, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        win.timeout(-1)
+        scroll = 0
+        while True:
+            win.clear()
+            win.border()
+            try:
+                win.addnstr(0, 2, " Help ", win_w - 4)
+            except curses.error:
+                pass
+            view = lines[scroll : scroll + (win_h - 2)]
+            for i, ln in enumerate(view):
+                try:
+                    win.addnstr(1 + i, 2, ln.ljust(win_w - 4), win_w - 4)
+                except curses.error:
+                    pass
+            win.refresh()
+            ch = win.getch()
+            if ch in (-1, 27, ord("q"), ord("?"), 10, 13):
+                return
+            if ch in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                scroll = min(max(0, len(lines) - (win_h - 2)), scroll + 1)
+
     def _export_report(self, sv: SessionView) -> None:
         rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=self.cfg.report_max_log_lines)
         summary = {
@@ -557,6 +617,9 @@ class ClawMonitorTUI:
                     i = 2
                 self.refresh_seconds = opts[(i + 1) % len(opts)]
                 dirty = True
+            elif ch == ord("?"):
+                self._help_overlay(stdscr)
+                dirty = True
             elif ch in (ord("e"), 10, 13):
                 sv = sessions[self.selected] if sessions else None
                 if ch == ord("e") and sv:
@@ -608,7 +671,7 @@ class ClawMonitorTUI:
             if self._last_refresh_at is not None:
                 refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
             footer = (
-                f"[q]quit [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
+                f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
                 f"[Enter]nudge [e]export [l]logs  sel={self.selected+1}/{len(sessions)} lastRefresh={refresh_age}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
