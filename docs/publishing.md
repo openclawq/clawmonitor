@@ -45,10 +45,7 @@ If you publish to PyPI:
 
 Suggested release flow:
 
-1) Bump `pyproject.toml` version + `CHANGELOG.md`
-2) Create a git tag `vX.Y.Z`
-3) Create a GitHub Release for that tag
-4) Publish wheels/sdist to PyPI (manual `twine`, or GitHub Actions “trusted publishing”)
+See `docs/release-process.md` for the step-by-step checklist.
 
 ## GitHub Actions (recommended)
 
