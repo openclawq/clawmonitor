@@ -4,18 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmonitor"
-version = "0.1.1"
+version = "0.1.2"
 description = "Real-time OpenClaw session monitor (TUI) with Gateway log correlation and manual progress nudges."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "OpenClaw community" }]
 keywords = ["openclaw", "monitoring", "tui", "observability", "feishu", "telegram"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",

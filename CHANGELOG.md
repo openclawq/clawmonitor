@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Packaging: use SPDX `license = "MIT"` metadata (avoid setuptools deprecation warnings).
+- Docs: clarify pip-only installation wording.
+
 ## 0.1.1
 
 - Telegram: detect “thread binding” routing (chat → different sessionKey), flag it (`BOUND_OTHER` / `BIND`), and show the binding in TUI details.
@@ -11,4 +16,3 @@
 ## 0.1.0
 
 - Initial alpha release: TUI + status/snapshot/report/nudge commands.
-
