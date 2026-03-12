@@ -104,6 +104,39 @@ def _extract_inbound_from_internal_wrapper(text: str) -> Optional[str]:
         if sender_id and sender != sender_id:
             continue
         return msg
+
+    # Fallback: some wrappers append the real user message as a plain trailing
+    # line/paragraph (no "sender_id: ..." prefix). Example:
+    #   ... Sender (untrusted metadata): ```json {...} ```
+    #   <actual user text>
+    # We treat the post-metadata tail as the real inbound.
+    tail = ""
+    last_meta = None
+    for m2 in _META_BLOCK_RE.finditer(s):
+        last_meta = m2
+    if last_meta:
+        tail = s[last_meta.end() :].strip()
+    else:
+        tail = s.strip()
+
+    # Drop stray code fences/braces in case the tail begins with them.
+    tail_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    tail_lines = [ln for ln in tail_lines if not ln.startswith("```") and ln not in ("{", "}", "[", "]")]
+    if tail_lines:
+        candidate = "\n".join(tail_lines).strip()
+        if candidate and not _is_internal_user_text(candidate):
+            return candidate
+
+    # Last resort: pick the last non-internal non-metadata line.
+    for ln in reversed(lines[-40:]):
+        if ln.startswith("```"):
+            continue
+        if ln in ("{", "}", "[", "]"):
+            continue
+        if ln.lower().startswith(("conversation info", "sender (untrusted metadata)", "sender:", "skills store policy")):
+            continue
+        if not _is_internal_user_text(ln):
+            return ln.strip()
     return None
 
 
