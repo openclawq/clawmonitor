@@ -19,8 +19,6 @@ python3 -m pip install -e .
 
 ## 安装（PyPI）
 
-如果发布到 PyPI，安装会更简单：
-
 ```bash
 pip install clawmonitor
 ```
