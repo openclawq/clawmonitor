@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawmonitor"
+version = "0.1.0"
+description = "Real-time OpenClaw session monitor (TUI) with Gateway log correlation and manual progress nudges."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "OpenClaw community" }]
+dependencies = [
+  "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.scripts]
+clawmonitor = "clawmonitor.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

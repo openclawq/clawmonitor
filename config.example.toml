@@ -1,0 +1,20 @@
+# ClawMonitor configuration (TOML)
+
+[openclaw]
+root = "~/.openclaw"
+openclaw_bin = "openclaw"
+
+[refresh]
+ui_seconds = 1.0
+gateway_log_poll_seconds = 2.0
+channels_status_poll_seconds = 5.0
+delivery_queue_poll_seconds = 30.0
+
+[limits]
+transcript_tail_bytes = 65536
+gateway_log_ring_lines = 5000
+report_max_log_lines = 200
+
+[ui]
+hide_system_sessions = false
+
