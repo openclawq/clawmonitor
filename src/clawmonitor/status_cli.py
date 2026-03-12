@@ -11,6 +11,7 @@ from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
 from .redact import redact_text
+from .session_keys import parse_session_key
 from .session_store import SessionMeta, list_sessions
 from .state import WorkState, compute_state
 from .thread_bindings import load_telegram_thread_bindings
@@ -99,6 +100,16 @@ def collect_status(
         computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
 
         flags: List[str] = []
+        key_info = parse_session_key(meta.key)
+        if key_info.kind == "subagent":
+            flags.append("SUBAGENT")
+        elif key_info.kind == "acp":
+            flags.append("ACP")
+        elif key_info.kind == "heartbeat":
+            flags.append("HEARTBEAT")
+
+        if not cfg_snapshot.configured_agent_ids.get(meta.agent_id, False):
+            flags.append("IMPL_AGENT")
         if computed.no_feedback:
             flags.append("NO_FEEDBACK")
         if df:

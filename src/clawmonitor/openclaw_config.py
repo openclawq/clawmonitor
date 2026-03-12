@@ -14,6 +14,7 @@ class CompactionConfig:
 @dataclass(frozen=True)
 class OpenClawConfigSnapshot:
     compaction_by_agent: Dict[str, CompactionConfig]
+    configured_agent_ids: Dict[str, bool]
 
 
 def _get(d: Any, *path: str) -> Any:
@@ -40,6 +41,7 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
     defaults = CompactionConfig(mode=str(defaults_mode) if isinstance(defaults_mode, str) else None)
 
     compaction_by_agent: Dict[str, CompactionConfig] = {}
+    configured_agent_ids: Dict[str, bool] = {}
     agents_list = _get(doc, "agents", "list")
     if isinstance(agents_list, list):
         for ent in agents_list:
@@ -48,6 +50,7 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
             agent_id = ent.get("id")
             if not isinstance(agent_id, str) or not agent_id:
                 continue
+            configured_agent_ids[agent_id] = True
             mode = _get(ent, "compaction", "mode")
             if isinstance(mode, str):
                 compaction_by_agent[agent_id] = CompactionConfig(mode=mode)
@@ -55,6 +58,6 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
                 compaction_by_agent[agent_id] = defaults
     else:
         compaction_by_agent["main"] = defaults
+        configured_agent_ids["main"] = True
 
-    return OpenClawConfigSnapshot(compaction_by_agent=compaction_by_agent)
-
+    return OpenClawConfigSnapshot(compaction_by_agent=compaction_by_agent, configured_agent_ids=configured_agent_ids)

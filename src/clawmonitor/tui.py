@@ -16,7 +16,9 @@ from .diagnostics import Finding, diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .locks import LockInfo, lock_path_for_session_file, read_lock
+from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
 from .redact import redact_text
+from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .state import SessionComputed, WorkState, compute_state
@@ -167,13 +169,17 @@ def _channel_account_info(
     return None
 
 
-def _agent_markers(meta: SessionMeta) -> List[str]:
+def _agent_markers(meta: SessionMeta, cfg_snapshot: Optional[OpenClawConfigSnapshot]) -> List[str]:
     markers: List[str] = []
-    kind = ((meta.kind or "") + " " + (meta.chat_type or "")).lower()
+    info = parse_session_key(meta.key)
+    if info.kind == "subagent":
+        markers.append(f"SUB{max(1, info.subagent_depth)}")
+    if info.kind == "acp":
+        markers.append("ACP")
+    if cfg_snapshot and not cfg_snapshot.configured_agent_ids.get(meta.agent_id, False):
+        markers.append("IMPL")
     aid = (meta.agent_id or "").lower()
-    if "subagent" in kind or "sub-agent" in kind:
-        markers.append("SUBAG")
-    if "codex" in kind or aid.startswith("codex") or "codex" in aid:
+    if aid == "codex" or aid.startswith("codex"):
         markers.append("CODEX")
     return markers
 
@@ -241,6 +247,8 @@ class MonitorModel:
         self._channels_last_poll = 0.0
         self._telegram_bindings: Dict[str, Dict[str, TelegramThreadBinding]] = {}
         self._telegram_bindings_last_load = 0.0
+        self._cfg_snapshot: Optional[OpenClawConfigSnapshot] = None
+        self._cfg_snapshot_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -249,6 +257,10 @@ class MonitorModel:
     @property
     def channels(self) -> Optional[ChannelsSnapshot]:
         return self._channels
+
+    @property
+    def config_snapshot(self) -> Optional[OpenClawConfigSnapshot]:
+        return self._cfg_snapshot
 
     @property
     def sessions(self) -> List[SessionView]:
@@ -302,6 +314,16 @@ class MonitorModel:
         self._telegram_bindings = {"default": bindings}
         self._telegram_bindings_last_load = now
 
+    def _refresh_config_snapshot(self) -> None:
+        now = time.time()
+        if now - self._cfg_snapshot_last_load < 2.0:
+            return
+        try:
+            self._cfg_snapshot = read_openclaw_config_snapshot(self.cfg.openclaw_root)
+        except Exception:
+            self._cfg_snapshot = None
+        self._cfg_snapshot_last_load = now
+
     def _telegram_binding_for(self, *, account_id: Optional[str], to: Optional[str]) -> Optional[TelegramThreadBinding]:
         if not to or not isinstance(to, str) or not to.startswith("telegram:"):
             return None
@@ -316,6 +338,7 @@ class MonitorModel:
         self._refresh_gateway_logs()
         self._refresh_channels()
         self._refresh_telegram_bindings()
+        self._refresh_config_snapshot()
 
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
@@ -325,7 +348,14 @@ class MonitorModel:
             tail = self._tail_for(meta.session_file)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
             df = self._delivery_map.get(meta.key)
-            computed = compute_state(meta.aborted_last_run, tail, lock, df)
+            safeguard_ok = True
+            try:
+                if self._cfg_snapshot:
+                    compaction_cfg = self._cfg_snapshot.compaction_by_agent.get(meta.agent_id) or self._cfg_snapshot.compaction_by_agent.get("main")
+                    safeguard_ok = bool(compaction_cfg and compaction_cfg.mode == "safeguard")
+            except Exception:
+                safeguard_ok = True
+            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
             findings = diagnose(
                 session_key=meta.key,
                 channel=meta.channel,
@@ -480,7 +510,7 @@ class ClawMonitorTUI:
                 flags.append("TRXM")
             if sv.telegram_routed_elsewhere:
                 flags.append("BIND")
-            flags.extend(_agent_markers(sv.meta))
+            flags.extend(_agent_markers(sv.meta, self.model.config_snapshot))
             flag_str = ",".join(flags)
             line = (
                 f"{_fit(sv.meta.agent_id, agent_w)}  "
@@ -529,7 +559,7 @@ class ClawMonitorTUI:
     def _draw_details_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
         lines: List[str] = []
         lines.append(f"SessionKey: {sv.meta.key}")
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
         if sv.meta.kind or sv.meta.chat_type:
@@ -603,7 +633,7 @@ class ClawMonitorTUI:
 
         # Status header + lines
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
@@ -722,7 +752,7 @@ class ClawMonitorTUI:
 
         # Status
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
