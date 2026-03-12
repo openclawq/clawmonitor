@@ -70,7 +70,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     openclaw_root = Path(_expanduser(str(openclaw.get("root", "~/.openclaw"))))
     openclaw_bin = str(openclaw.get("openclaw_bin", "openclaw"))
 
-    ui_seconds = float(refresh.get("ui_seconds", 1.0))
+    ui_seconds = float(refresh.get("ui_seconds", 5.0))
     gateway_log_poll_seconds = float(refresh.get("gateway_log_poll_seconds", 2.0))
     channels_status_poll_seconds = float(refresh.get("channels_status_poll_seconds", 5.0))
     delivery_queue_poll_seconds = float(refresh.get("delivery_queue_poll_seconds", 30.0))
@@ -93,4 +93,3 @@ def load_config(path: Optional[Path] = None) -> Config:
         report_max_log_lines=report_max_log_lines,
         hide_system_sessions=hide_system_sessions,
     )
-

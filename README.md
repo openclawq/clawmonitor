@@ -24,9 +24,13 @@ clawmonitor tui
 Other commands:
 
 ```bash
-clawmonitor snapshot --json
+clawmonitor snapshot --format json
+clawmonitor snapshot --format md
 clawmonitor nudge --session-key 'agent:main:main' --template progress
 clawmonitor status
+clawmonitor status --format json
+clawmonitor status --format md
+clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
 ```
 
@@ -52,7 +56,10 @@ Runtime data (NOT stored in this repo):
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session
 - `r`: force refresh
+- `f`: cycle refresh interval
 - `q`: quit
+
+Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
 
 ## Notes
 

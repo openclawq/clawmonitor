@@ -129,6 +129,44 @@ def format_table(rows: List[StatusRow], limit: Optional[int] = None) -> str:
     return "\n".join(lines)
 
 
+def format_markdown(rows: List[StatusRow], limit: Optional[int] = None) -> str:
+    shown = rows[:limit] if limit else rows
+    header = [
+        "agentId",
+        "channel",
+        "state",
+        "userAge",
+        "assistantAge",
+        "runFor",
+        "flags",
+        "sessionKey",
+        "reason",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    def esc(v: str) -> str:
+        return (v or "-").replace("|", "\\|").replace("\n", " ")
+
+    for r in shown:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    esc(r.agent_id),
+                    esc(r.channel or "-"),
+                    esc(r.state),
+                    esc(r.user_age),
+                    esc(r.assistant_age),
+                    esc(r.run_for),
+                    esc(",".join(r.flags) if r.flags else "-"),
+                    esc(r.key),
+                    esc(r.reason),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
 def format_json(rows: List[StatusRow], openclaw_root: Path) -> str:
     doc: Dict[str, Any] = {
         "openclaw_root": str(openclaw_root),
@@ -181,4 +219,3 @@ def watch_loop(
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         return
-

@@ -7,10 +7,18 @@ from typing import Any, Dict, Optional
 
 from .actions import TEMPLATES, send_nudge
 from .config import load_config
+from .delivery_queue import load_failed_delivery_map
+from .diagnostics import diagnose, related_logs
 from .eventlog import EventLog
+from .gateway_logs import GatewayLogTailer
+from .locks import lock_path_for_session_file, read_lock
+from .openclaw_config import read_openclaw_config_snapshot
 from .redact import redact_text
+from .reports import write_report_files
 from .session_store import list_sessions
-from .status_cli import collect_status, format_json as format_status_json, format_table, watch_loop
+from .state import compute_state
+from .status_cli import collect_status, format_json as format_status_json, format_markdown as format_status_markdown, format_table, watch_loop
+from .transcript_tail import TranscriptTail, tail_transcript
 from .tui import ClawMonitorTUI
 
 
@@ -49,8 +57,30 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             for s in sessions
         ],
     }
-    if args.json:
+    fmt = args.format
+    if getattr(args, "json", False):
+        fmt = "json"
+    if fmt == "json":
         print(json.dumps(out, ensure_ascii=False, indent=2))
+    elif fmt == "md":
+        header = ["agentId", "channel", "accountId", "updatedAtMs", "sessionKey", "systemSent"]
+        lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+        for s in sessions:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        s.agent_id or "-",
+                        s.channel or "-",
+                        s.account_id or "-",
+                        str(s.updated_at_ms or "-"),
+                        s.key or "-",
+                        "true" if s.system_sent else "false",
+                    ]
+                )
+                + " |"
+            )
+        print("\n".join(lines))
     else:
         for s in sessions:
             print(f"{s.agent_id} {s.channel or '-'} {s.key} updatedAt={s.updated_at_ms}")
@@ -84,8 +114,86 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     if args.format == "json":
         print(format_status_json(rows, cfg.openclaw_root))
+    elif args.format == "md":
+        print(format_status_markdown(rows, limit=args.limit))
     else:
         print(format_table(rows, limit=args.limit))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    metas = list_sessions(cfg.openclaw_root)
+    meta = next((m for m in metas if m.key == args.session_key), None)
+    if not meta:
+        raise SystemExit(f"Unknown sessionKey: {args.session_key}")
+
+    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None)
+    lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
+    delivery_map = load_failed_delivery_map(cfg.openclaw_root)
+    df = delivery_map.get(meta.key)
+
+    cfg_snapshot = read_openclaw_config_snapshot(cfg.openclaw_root)
+    compaction_cfg = cfg_snapshot.compaction_by_agent.get(meta.agent_id) or cfg_snapshot.compaction_by_agent.get("main")
+    safeguard_ok = (compaction_cfg.mode == "safeguard") if compaction_cfg and compaction_cfg.mode else False
+    computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
+
+    gtail = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
+    if not args.no_gateway:
+        gtail.poll(limit=min(500, max(50, args.gateway_poll_limit)))
+
+    findings = diagnose(
+        session_key=meta.key,
+        channel=meta.channel,
+        account_id=meta.account_id,
+        delivery_failed=df is not None,
+        no_feedback=computed.no_feedback,
+        is_working=computed.state.value == "WORKING",
+        gateway_lines=gtail.lines,
+    )
+    rel = related_logs(gtail.lines, meta.key, meta.channel, meta.account_id, limit=cfg.report_max_log_lines)
+
+    summary: Dict[str, Any] = {
+        "agent_id": meta.agent_id,
+        "channel": meta.channel,
+        "account_id": meta.account_id,
+        "state": computed.state.value,
+        "reason": computed.reason,
+        "no_feedback": computed.no_feedback,
+        "delivery_failed": df is not None,
+        "safety_alert": computed.safety_alert,
+        "safeguard_alert": computed.safeguard_alert,
+        "aborted_last_run": meta.aborted_last_run,
+        "system_sent": meta.system_sent,
+        "last_user_at": tail.last_user.ts.isoformat() if tail.last_user and tail.last_user.ts else None,
+        "last_assistant_at": tail.last_assistant.ts.isoformat() if tail.last_assistant and tail.last_assistant.ts else None,
+        "last_user_preview": redact_text(tail.last_user.preview) if tail.last_user else None,
+        "last_assistant_preview": redact_text(tail.last_assistant.preview) if tail.last_assistant else None,
+    }
+
+    formats: List[str]
+    if args.format == "both":
+        formats = ["json", "md"]
+    else:
+        formats = [args.format]
+    out_dir = Path(args.out_dir).expanduser() if args.out_dir else None
+    paths = write_report_files(
+        session_key=meta.key,
+        summary=summary,
+        findings=findings,
+        related_logs=rel,
+        max_log_lines=cfg.report_max_log_lines,
+        formats=formats,
+        out_dir=out_dir,
+    )
+    elog = EventLog()
+    for k, p in paths.items():
+        elog.write("report.written", sessionKey=meta.key, format=k, path=str(p))
+    if args.json:
+        print(json.dumps({k: str(p) for k, p in paths.items()}, ensure_ascii=False, indent=2))
+    else:
+        for k, p in paths.items():
+            print(f"{k}: {p}")
     return 0
 
 
@@ -113,8 +221,9 @@ def main() -> None:
     tui.set_defaults(func=cmd_tui)
 
     snap = sub.add_parser("snapshot", help="Print a snapshot of known sessions")
-    snap.add_argument("--json", action="store_true", help="Output JSON")
-    snap.set_defaults(func=cmd_snapshot, json=True)
+    snap.add_argument("--format", choices=["text", "json", "md"], default="text")
+    snap.add_argument("--json", action="store_true", help="Alias for --format json")
+    snap.set_defaults(func=cmd_snapshot)
 
     nudge = sub.add_parser("nudge", help="Send a progress nudge via chat.send")
     nudge.add_argument("--session-key", required=True)
@@ -124,11 +233,20 @@ def main() -> None:
     nudge.set_defaults(func=cmd_nudge)
 
     status = sub.add_parser("status", help="Print computed per-session core status (no curses)")
-    status.add_argument("--format", choices=["text", "json"], default="text")
+    status.add_argument("--format", choices=["text", "json", "md"], default="text")
     status.add_argument("--limit", type=int, help="Max sessions to print (text only)")
     status.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     status.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     status.set_defaults(func=cmd_status)
+
+    rep = sub.add_parser("report", help="Export a single-session report (JSON/MD)")
+    rep.add_argument("--session-key", required=True)
+    rep.add_argument("--format", choices=["json", "md", "both"], default="both")
+    rep.add_argument("--out-dir", help="Override output directory (default: XDG_STATE_HOME/clawmonitor/reports)")
+    rep.add_argument("--no-gateway", action="store_true", help="Disable Gateway logs tail (offline report)")
+    rep.add_argument("--gateway-poll-limit", type=int, default=200, help="Max lines to poll from logs.tail")
+    rep.add_argument("--json", action="store_true", help="Print paths as JSON")
+    rep.set_defaults(func=cmd_report)
 
     watch = sub.add_parser("watch", help="Continuously print status table (no curses)")
     watch.add_argument("--interval", type=float, default=1.0, help="Refresh interval seconds")
