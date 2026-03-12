@@ -34,6 +34,23 @@ def _match_latest(lines: Sequence[GatewayLogLine], pattern: re.Pattern[str]) -> 
     return None
 
 
+def _match_latest_scoped(
+    lines: Sequence[GatewayLogLine],
+    pattern: re.Pattern[str],
+    *,
+    subsystem_contains: Optional[str] = None,
+) -> Optional[GatewayLogLine]:
+    sub = (subsystem_contains or "").lower().strip()
+    for ln in reversed(lines):
+        if sub:
+            s = (ln.subsystem or "").lower()
+            if sub not in s:
+                continue
+        if pattern.search(_line_text(ln)):
+            return ln
+    return None
+
+
 def related_logs(
     all_lines: Sequence[GatewayLogLine],
     session_key: Optional[str],
@@ -75,6 +92,7 @@ def diagnose(
 ) -> List[Finding]:
     findings: List[Finding] = []
     rel = related_logs(gateway_lines, session_key=session_key, channel=channel, account_id=account_id, limit=400)
+    chan = (channel or "").lower().strip()
 
     if delivery_failed:
         findings.append(
@@ -89,6 +107,35 @@ def diagnose(
                 ],
             )
         )
+
+    # Telegram outbound send failures (channel-level). This often explains "nudge worked but no push arrived".
+    if chan == "telegram":
+        ln = _match_latest_scoped(
+            gateway_lines,
+            re.compile(r"telegram message failed:.*sendMessage.*Network request.*failed", re.IGNORECASE),
+            subsystem_contains="telegram",
+        )
+        if not ln:
+            ln = _match_latest_scoped(
+                gateway_lines,
+                re.compile(r"\bsendMessage\b.*(ETIMEDOUT|ECONNRESET|ENOTFOUND|Network request).*failed", re.IGNORECASE),
+                subsystem_contains="telegram",
+            )
+        if ln:
+            findings.append(
+                Finding(
+                    id="telegram_sendmessage_network_failed",
+                    severity="critical",
+                    summary="Telegram outbound sendMessage failed (network request failed). IM pushes will not arrive until egress/proxy is fixed.",
+                    evidence=[Evidence(ts=str(ln.ts) if ln.ts else None, text=_line_text(ln)[:500])],
+                    next_steps=[
+                        "Check gateway host egress to api.telegram.org (DNS/TCP/TLS).",
+                        "If using proxies, verify HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY settings for the gateway service.",
+                        "Ensure only one gateway instance uses getUpdates for the bot token (multi-instance can cause stalls and delivery issues).",
+                        "Re-test by sending a normal message in Telegram and confirm channels.status lastOutboundAt updates.",
+                    ],
+                )
+            )
 
     # Feishu: health-monitor restarting during long runs
     ln = _match_latest(rel, re.compile(r"health-monitor:\s+restarting.*stale-socket", re.IGNORECASE))
@@ -197,4 +244,3 @@ def diagnose(
             )
         )
     return safe_findings
-

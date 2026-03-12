@@ -36,9 +36,13 @@ def gateway_call(
     method: str,
     params: Optional[Dict[str, Any]] = None,
     timeout_ms: int = 10000,
+    *,
+    log_level: str = "silent",
 ) -> OpenClawResult:
     args = [
         openclaw_bin,
+        "--log-level",
+        log_level,
         "gateway",
         "call",
         method,
@@ -52,4 +56,3 @@ def gateway_call(
     data = _extract_json(p.stdout)
     ok = p.returncode == 0 and data is not None
     return OpenClawResult(ok=ok, data=data, raw_stdout=p.stdout, raw_stderr=p.stderr, returncode=p.returncode)
-

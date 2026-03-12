@@ -160,7 +160,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     gtail = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
     if not args.no_gateway:
-        gtail.poll(limit=min(500, max(50, args.gateway_poll_limit)))
+        gtail.poll(limit=min(cfg.gateway_log_ring_lines, max(50, args.gateway_poll_limit)))
 
     findings = diagnose(
         session_key=meta.key,
