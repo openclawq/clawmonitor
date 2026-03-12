@@ -16,6 +16,10 @@ Online (Gateway reachable):
 - Gateway logs tail: `openclaw gateway call logs.tail --json` (incremental cursor)
 - Channel runtime snapshot: `openclaw gateway call channels.status --json`
 
+Telegram routing (local state):
+
+- Thread bindings (conversation → sessionKey): `~/.openclaw/telegram/thread-bindings-<accountId>.json`
+
 ## Outputs
 
 - TUI: `clawmonitor tui` (color-coded rows, footer hotkeys, manual refresh and interval cycling)

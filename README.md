@@ -17,6 +17,18 @@ cd ~/program/clawmonitor
 python3 -m pip install -e .
 ```
 
+## Install (PyPI / uv / pipx)
+
+Once published to PyPI, you’ll be able to install via:
+
+```bash
+pip install clawmonitor
+# or
+pipx install clawmonitor
+# or
+uv tool install clawmonitor
+```
+
 ## Run
 
 ```bash
@@ -66,6 +78,21 @@ Runtime data (NOT stored in this repo):
 - `q`: quit
 
 Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
+
+## Telegram note: ACP “thread bindings”
+
+OpenClaw can route a Telegram chat to a different session key via local *thread bindings*.
+This may make it look like your “main” session stopped receiving messages.
+
+ClawMonitor detects this and flags it:
+
+- `BOUND_OTHER` in `clawmonitor status`
+- `BIND` in the TUI list
+
+Relevant files/settings:
+
+- Thread bindings: `~/.openclaw/telegram/thread-bindings-default.json`
+- Config toggle: `~/.openclaw/openclaw.json` → `channels.telegram.threadBindings.spawnAcpSessions`
 
 ## First run
 

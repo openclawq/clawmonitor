@@ -17,6 +17,18 @@ cd ~/program/clawmonitor
 python3 -m pip install -e .
 ```
 
+## 安装（PyPI / uv / pipx）
+
+如果发布到 PyPI，安装会更简单：
+
+```bash
+pip install clawmonitor
+# 或
+pipx install clawmonitor
+# 或
+uv tool install clawmonitor
+```
+
 ## 运行
 
 推荐先初始化配置：
@@ -73,6 +85,20 @@ clawmonitor watch --interval 1
 - `q`：退出
 
 若终端支持颜色，行会按健康度着色：`OK` 绿 / `RUN` 青 / `IDLE` 黄 / `ALERT` 红。
+
+## Telegram 说明：ACP 线程绑定（thread bindings）
+
+OpenClaw 可能会把某个 Telegram chat 路由到另一个 sessionKey（例如 ACP session），导致你以为 “main 不收消息了”。
+
+ClawMonitor 会做提示：
+
+- `clawmonitor status`：`BOUND_OTHER`
+- TUI 列表：`BIND`
+
+相关文件/开关：
+
+- 线程绑定：`~/.openclaw/telegram/thread-bindings-default.json`
+- 配置开关：`~/.openclaw/openclaw.json` → `channels.telegram.threadBindings.spawnAcpSessions`
 
 ## 首次运行提示
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmonitor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Real-time OpenClaw session monitor (TUI) with Gateway log correlation and manual progress nudges."
 readme = "README.md"
 requires-python = ">=3.10"

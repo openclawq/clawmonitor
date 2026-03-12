@@ -14,4 +14,6 @@ This doc encodes recurring patterns seen in OpenClaw deployments:
 - Polling stall: no `getUpdates` for a long time (often proxy/NO_PROXY/egress or multi-instance competition)
 - Policy gates: dmPolicy/groupPolicy allowlists, mention gating in groups
 - `BOT_COMMANDS_TOO_MUCH` is usually not the root cause (command sync limits)
-
+- Thread bindings can route a DM to an ACP session key. If this surprises you, disable ACP spawning:
+  - `~/.openclaw/openclaw.json` → `channels.telegram.threadBindings.spawnAcpSessions=false`
+  - Clear `~/.openclaw/telegram/thread-bindings-default.json` for the affected chat id (backup first)
