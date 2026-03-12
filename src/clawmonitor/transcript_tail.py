@@ -60,6 +60,53 @@ def _is_internal_user_text(text: str) -> bool:
     return any(p.search(s) for p in _INTERNAL_USER_PATTERNS)
 
 
+_META_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+_SENDER_LINE_RE = re.compile(r"^([^:\n]{1,200}):\s*(.+)$")
+
+
+def _extract_inbound_from_internal_wrapper(text: str) -> Optional[str]:
+    """
+    Best-effort: internal wrappers often include a JSON metadata block and then a final line like:
+      <sender_id>: <actual user message>
+    We treat that suffix message as the real user inbound when sender_id is not 'cli'.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    sender_id: Optional[str] = None
+    m = _META_BLOCK_RE.search(s)
+    if m:
+        try:
+            meta = json.loads(m.group(1))
+            if isinstance(meta, dict):
+                sid = meta.get("sender_id") or meta.get("senderId") or meta.get("sender")
+                if isinstance(sid, str):
+                    sender_id = sid.strip()
+        except Exception:
+            sender_id = None
+
+    if sender_id and sender_id.lower() in ("cli", "system", "gateway", "openclaw"):
+        return None
+
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    for ln in reversed(lines[-20:]):
+        mm = _SENDER_LINE_RE.match(ln)
+        if not mm:
+            continue
+        sender = (mm.group(1) or "").strip()
+        msg = (mm.group(2) or "").strip()
+        if not msg:
+            continue
+        if sender.lower() in ("message_id", "sender_id", "sender", "timestamp"):
+            continue
+        # If we have a sender_id, prefer matching it, otherwise accept any.
+        if sender_id and sender != sender_id:
+            continue
+        return msg
+    return None
+
+
 @dataclass(frozen=True)
 class TailMessage:
     role: str
@@ -157,13 +204,19 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
             continue
 
         if role == "user":
-            preview = _extract_text(msg.get("content"))
+            raw = _extract_text(msg.get("content"), max_chars=8000)
+            preview = raw[:400] if raw else ""
             if last_user is None:
                 last_user = TailMessage(role="user", ts=ts, preview=preview)
-            if last_trigger is None and _is_internal_user_text(preview):
+            if last_trigger is None and _is_internal_user_text(raw):
                 last_trigger = TailMessage(role="user", ts=ts, preview=preview)
-            if last_user_send is None and not _is_internal_user_text(preview):
-                last_user_send = TailMessage(role="user", ts=ts, preview=preview)
+            if last_user_send is None:
+                if _is_internal_user_text(raw):
+                    extracted = _extract_inbound_from_internal_wrapper(raw)
+                    if extracted:
+                        last_user_send = TailMessage(role="user", ts=ts, preview=extracted[:400])
+                else:
+                    last_user_send = TailMessage(role="user", ts=ts, preview=preview)
             continue
 
         if role == "assistant" and last_assistant is None:
