@@ -71,10 +71,26 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
     if not t:
         return []
     words = t.split()
+    # If there are no whitespace splits (common for CJK), treat as a single chunk.
+    if len(words) <= 1 and len(t) > width:
+        words = [t]
     lines: List[str] = []
     cur: List[str] = []
     cur_len = 0
     for w in words:
+        if len(w) > width:
+            # Break long tokens into width-sized chunks to avoid a single unwrapped line.
+            if cur:
+                lines.append(" ".join(cur)[:width])
+                cur = []
+                cur_len = 0
+                if len(lines) >= max_lines:
+                    break
+            for i in range(0, len(w), width):
+                lines.append(w[i : i + width])
+                if len(lines) >= max_lines:
+                    break
+            continue
         if not cur:
             cur = [w]
             cur_len = len(w)
@@ -391,6 +407,37 @@ class ClawMonitorTUI:
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
         if not sv:
             return
+        rel_logs: List[str] = []
+        if self.show_logs:
+            rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
+            rel_logs = [ln.text for ln in rel][-20:]
+
+        log_budget = 0
+        if self.show_logs:
+            log_budget = min(10, max(0, h // 3))
+        detail_h = max(0, h - (log_budget + (1 if log_budget else 0)))
+
+        # Clear details region first.
+        for j in range(detail_h):
+            self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
+
+        if w >= 90 and detail_h >= 10:
+            self._draw_details_3col(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+        elif w >= 24 and detail_h >= 12:
+            self._draw_details_3pane(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+        else:
+            self._draw_details_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+
+        if self.show_logs and log_budget:
+            log_y = y + detail_h
+            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
+            log_y += 1
+            for i in range(min(log_budget, len(rel_logs))):
+                self._safe_addnstr(stdscr, log_y + i, x, rel_logs[i][:w].ljust(w), w)
+            for j in range(len(rel_logs), log_budget):
+                self._safe_addnstr(stdscr, log_y + j, x, " ".ljust(w), w)
+
+    def _draw_details_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
         lines: List[str] = []
         lines.append(f"SessionKey: {sv.meta.key}")
         markers = _agent_markers(sv.meta)
@@ -404,6 +451,8 @@ class ClawMonitorTUI:
         else:
             lines.append("Lock: -")
         lines.append(f"abortedLastRun: {sv.meta.aborted_last_run}  systemSent: {sv.meta.system_sent}")
+        if sv.delivery_failure:
+            lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
         lines.append("")
         if sv.tail.last_user:
             lines.append(f"Last USER @ {_fmt_dt(sv.tail.last_user.ts)}")
@@ -418,9 +467,6 @@ class ClawMonitorTUI:
                 lines.append(f"  {part}")
         else:
             lines.append("Last ASST: -")
-        if sv.delivery_failure:
-            lines.append("")
-            lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
         lines.append("")
         lines.append("Diagnosis:")
         if sv.findings:
@@ -429,29 +475,174 @@ class ClawMonitorTUI:
         else:
             lines.append("- (none)")
 
-        rel_logs: List[str] = []
-        if self.show_logs:
-            rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
-            rel_logs = [ln.text for ln in rel][-20:]
-
-        log_budget = 0
-        if self.show_logs:
-            log_budget = min(10, max(0, h // 3))
-        detail_h = max(0, h - (log_budget + (1 if log_budget else 0)))
-
-        for i in range(min(detail_h, len(lines))):
+        for i in range(min(h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
-        for j in range(len(lines), detail_h):
-            self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
 
-        if self.show_logs and log_budget:
-            log_y = y + detail_h
-            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
-            log_y += 1
-            for i in range(min(log_budget, len(rel_logs))):
-                self._safe_addnstr(stdscr, log_y + i, x, rel_logs[i][:w].ljust(w), w)
-            for j in range(len(rel_logs), log_budget):
-                self._safe_addnstr(stdscr, log_y + j, x, " ".ljust(w), w)
+    def _draw_details_3col(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+        # Three columns: Status | Last User Send | Last Claw Send
+        sep = 1
+        col1 = max(22, int(w * 0.34))
+        col2 = max(22, int(w * 0.33))
+        col3 = max(22, w - col1 - col2 - sep * 2)
+        if col3 < 22:
+            # Fallback: rebalance a bit
+            col1 = max(22, int(w * 0.33))
+            col2 = max(22, int(w * 0.33))
+            col3 = max(22, w - col1 - col2 - sep * 2)
+        x1 = x
+        x2 = x + col1 + sep
+        x3 = x2 + col2 + sep
+
+        # Separators
+        try:
+            stdscr.vline(y, x + col1, curses.ACS_VLINE, max(0, h))
+            stdscr.vline(y, x2 + col2, curses.ACS_VLINE, max(0, h))
+        except curses.error:
+            pass
+
+        # Column headers
+        self._safe_addnstr(stdscr, y, x1, _fit("Status", col1).ljust(col1), col1, curses.A_BOLD)
+        self._safe_addnstr(stdscr, y, x2, _fit("Last User Send", col2).ljust(col2), col2, curses.A_BOLD)
+        self._safe_addnstr(stdscr, y, x3, _fit("Last Claw Send", col3).ljust(col3), col3, curses.A_BOLD)
+
+        # Status column content
+        markers = _agent_markers(sv.meta)
+        mark_str = f" ({','.join(markers)})" if markers else ""
+        status_lines: List[str] = [
+            f"session: {sv.meta.key}",
+            f"agent: {sv.meta.agent_id}{mark_str}",
+            f"chan: {sv.meta.channel or '-'}  acct: {sv.meta.account_id or '-'}",
+        ]
+        if sv.meta.kind or sv.meta.chat_type:
+            status_lines.append(f"kind: {sv.meta.kind or '-'}")
+        status_lines.append(f"state: {sv.computed.state.value}")
+        status_lines.append(f"reason: {sv.computed.reason}")
+        if sv.lock:
+            status_lines.append(f"lock: pid={sv.lock.pid} alive={sv.lock.pid_alive}")
+            status_lines.append(f"      at {_fmt_dt(sv.lock.created_at)}")
+        else:
+            status_lines.append("lock: -")
+        if sv.delivery_failure:
+            status_lines.append(f"delivery: FAILED x{sv.delivery_failure.retry_count}")
+        if sv.computed.no_feedback:
+            status_lines.append("alert: NO_FEEDBACK")
+        if sv.computed.safety_alert:
+            status_lines.append("alert: SAFETY")
+        if sv.computed.safeguard_alert:
+            status_lines.append("alert: SAFEGUARD_OFF")
+
+        # Diagnosis (top few)
+        status_lines.append("")
+        status_lines.append("diagnosis:")
+        if sv.findings:
+            for f in sv.findings[:4]:
+                status_lines.append(f"- {f.severity} {f.id}")
+        else:
+            status_lines.append("- (none)")
+
+        # User column content
+        user_lines: List[str] = []
+        if sv.tail.last_user:
+            user_lines.append(f"at: {_fmt_dt(sv.tail.last_user.ts)}")
+            user_lines.append("")
+            user_lines.extend(_wrap_lines(redact_text(sv.tail.last_user.preview), max(0, col2 - 2), max_lines=max(1, h - 4)))
+        else:
+            user_lines.append("-")
+
+        # Assistant column content
+        asst_lines: List[str] = []
+        if sv.tail.last_assistant:
+            asst_lines.append(f"at: {_fmt_dt(sv.tail.last_assistant.ts)}")
+            asst_lines.append(f"stop: {sv.tail.last_assistant.stop_reason or '-'}")
+            asst_lines.append("")
+            asst_lines.extend(_wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col3 - 2), max_lines=max(1, h - 5)))
+        else:
+            asst_lines.append("-")
+
+        # Draw columns (start at y+1)
+        max_body = max(0, h - 1)
+        for i in range(min(max_body, len(status_lines))):
+            self._safe_addnstr(stdscr, y + 1 + i, x1, _fit(status_lines[i], col1), col1)
+        for i in range(min(max_body, len(user_lines))):
+            self._safe_addnstr(stdscr, y + 1 + i, x2, _fit(user_lines[i], col2), col2)
+        for i in range(min(max_body, len(asst_lines))):
+            self._safe_addnstr(stdscr, y + 1 + i, x3, _fit(asst_lines[i], col3), col3)
+
+    def _draw_details_3pane(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+        # Three stacked panes: Status / Last User Send / Last Claw Send
+        status_h = max(6, min(12, h // 2))
+        remaining = max(0, h - status_h - 2)  # 2 separators
+        user_h = max(3, remaining // 2)
+        asst_h = max(3, remaining - user_h)
+
+        y_status = y
+        y_sep1 = y_status + status_h
+        y_user = y_sep1 + 1
+        y_sep2 = y_user + user_h
+        y_asst = y_sep2 + 1
+
+        # separators
+        try:
+            stdscr.hline(y_sep1, x, curses.ACS_HLINE, max(0, w))
+            stdscr.hline(y_sep2, x, curses.ACS_HLINE, max(0, w))
+        except curses.error:
+            pass
+
+        # STATUS pane
+        self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, curses.A_BOLD)
+        markers = _agent_markers(sv.meta)
+        mark_str = f" ({','.join(markers)})" if markers else ""
+        status_lines: List[str] = [
+            f"SessionKey: {sv.meta.key}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+        ]
+        if sv.meta.kind or sv.meta.chat_type:
+            status_lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
+        status_lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
+        if sv.lock:
+            status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
+        else:
+            status_lines.append("Lock: -")
+        if sv.delivery_failure:
+            status_lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
+        flags: List[str] = []
+        if sv.computed.no_feedback:
+            flags.append("NO_FEEDBACK")
+        if sv.computed.safety_alert:
+            flags.append("SAFETY")
+        if sv.computed.safeguard_alert:
+            flags.append("SAFEGUARD_OFF")
+        if flags:
+            status_lines.append("Alerts: " + ",".join(flags))
+        # Diagnosis short
+        if sv.findings:
+            status_lines.append("Diagnosis: " + f"[{sv.findings[0].severity}] {sv.findings[0].id}")
+        else:
+            status_lines.append("Diagnosis: (none)")
+
+        body_h = max(0, status_h - 1)
+        for i in range(min(body_h, len(status_lines))):
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+
+        # USER pane
+        self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, curses.A_BOLD)
+        if sv.tail.last_user:
+            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_user.ts)}", w), w)
+            msg_lines = _wrap_lines(redact_text(sv.tail.last_user.preview), max(0, w), max_lines=max(0, user_h - 2))
+            for i, ln in enumerate(msg_lines[: max(0, user_h - 2)]):
+                self._safe_addnstr(stdscr, y_user + 2 + i, x, _fit(ln, w), w)
+        else:
+            self._safe_addnstr(stdscr, y_user + 1, x, _fit("-", w), w)
+
+        # ASSISTANT pane
+        self._safe_addnstr(stdscr, y_asst, x, _fit("Last Claw Send", w), w, curses.A_BOLD)
+        if sv.tail.last_assistant:
+            self._safe_addnstr(stdscr, y_asst + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w), w)
+            msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, asst_h - 2))
+            for i, ln in enumerate(msg_lines[: max(0, asst_h - 2)]):
+                self._safe_addnstr(stdscr, y_asst + 2 + i, x, _fit(ln, w), w)
+        else:
+            self._safe_addnstr(stdscr, y_asst + 1, x, _fit("-", w), w)
 
     def _template_picker(self, stdscr: "curses._CursesWindow") -> Optional[str]:
         items = list(TEMPLATES.keys())
