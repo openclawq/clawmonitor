@@ -48,6 +48,8 @@ _INTERNAL_USER_PATTERNS = [
     re.compile(r"^Skills store policy\s*\(operator configured\):", re.IGNORECASE),
     re.compile(r"^Conversation info \(untrusted metadata\):", re.IGNORECASE),
     re.compile(r"^Sender \(untrusted metadata\):", re.IGNORECASE),
+    re.compile(r"^\[Queued messages while agent was busy\]", re.IGNORECASE),
+    re.compile(r"^Queued messages while agent was busy", re.IGNORECASE),
 ]
 
 
@@ -73,6 +75,8 @@ class TranscriptTail:
     # last_user_send: best-effort "real inbound" user message, skipping common internal
     # control-plane injections used by CLI/harness.
     last_user_send: Optional[TailMessage]
+    # last_trigger: newest internal/control-plane trigger (if present).
+    last_trigger: Optional[TailMessage]
     last_assistant: Optional[TailMessage]
     last_tool_error: Optional[Tuple[Optional[datetime], str]]
     last_compaction_at: Optional[datetime]
@@ -80,7 +84,7 @@ class TranscriptTail:
 
 def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     if not path.exists():
-        return TranscriptTail(None, None, None, None, None)
+        return TranscriptTail(None, None, None, None, None, None)
     # Read backwards in growing chunks until we find both last user and last assistant
     # (or we hit an upper bound).
     max_total = max(256 * 1024, min(2 * 1024 * 1024, max_bytes * 16))
@@ -88,7 +92,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     try:
         size = path.stat().st_size
     except Exception:
-        return TranscriptTail(None, None, None, None, None)
+        return TranscriptTail(None, None, None, None, None, None)
 
     gathered_text = ""
     read_total = 0
@@ -115,6 +119,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
 
     last_user: Optional[TailMessage] = None
     last_user_send: Optional[TailMessage] = None
+    last_trigger: Optional[TailMessage] = None
     last_assistant: Optional[TailMessage] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
     last_compaction_at: Optional[datetime] = None
@@ -155,6 +160,8 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
             preview = _extract_text(msg.get("content"))
             if last_user is None:
                 last_user = TailMessage(role="user", ts=ts, preview=preview)
+            if last_trigger is None and _is_internal_user_text(preview):
+                last_trigger = TailMessage(role="user", ts=ts, preview=preview)
             if last_user_send is None and not _is_internal_user_text(preview):
                 last_user_send = TailMessage(role="user", ts=ts, preview=preview)
             continue
@@ -169,12 +176,14 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
             )
             continue
 
-        if last_user and last_user_send and last_assistant and last_tool_error and last_compaction_at:
+        # Stop early once we have enough for monitoring UI.
+        if last_user and last_assistant and (last_user_send or last_trigger):
             break
 
     return TranscriptTail(
         last_user=last_user,
         last_user_send=last_user_send,
+        last_trigger=last_trigger,
         last_assistant=last_assistant,
         last_tool_error=last_tool_error,
         last_compaction_at=last_compaction_at,

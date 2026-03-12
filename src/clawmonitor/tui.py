@@ -237,7 +237,7 @@ class MonitorModel:
 
     def _tail_for(self, session_file: Optional[Path]) -> TranscriptTail:
         if not session_file:
-            return TranscriptTail(None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None)
         try:
             st = session_file.stat()
             key = session_file
@@ -248,7 +248,7 @@ class MonitorModel:
             self._tail_cache[key] = (st.st_mtime, st.st_size, tail)
             return tail
         except Exception:
-            return TranscriptTail(None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None)
 
     def refresh(self) -> None:
         self._refresh_delivery_map()
@@ -422,10 +422,10 @@ class ClawMonitorTUI:
         for j in range(detail_h):
             self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
 
-        if w >= 90 and detail_h >= 10:
-            self._draw_details_3col(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
-        elif w >= 24 and detail_h >= 12:
-            self._draw_details_3pane(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+        if w >= 110 and detail_h >= 14:
+            self._draw_details_status_split3(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+        elif w >= 24 and detail_h >= 14:
+            self._draw_details_status_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
         else:
             self._draw_details_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
 
@@ -455,13 +455,10 @@ class ClawMonitorTUI:
         if sv.delivery_failure:
             lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
         lines.append("")
-        user_send = sv.tail.last_user_send
-        user_any = sv.tail.last_user
-        user_msg = user_send or user_any
-        if user_msg:
-            label = "Last User Send" if user_send else "Last Trigger (internal)"
-            lines.append(f"{label} @ {_fmt_dt(user_msg.ts)}")
-            for part in _wrap_lines(redact_text(user_msg.preview), max(0, w - 2), max_lines=3):
+        # Keep the legacy stacked view, but prefer strict user send.
+        if sv.tail.last_user_send:
+            lines.append(f"Last User Send @ {_fmt_dt(sv.tail.last_user_send.ts)}")
+            for part in _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, w - 2), max_lines=3):
                 lines.append(f"  {part}")
         else:
             lines.append("Last User Send: -")
@@ -483,185 +480,184 @@ class ClawMonitorTUI:
         for i in range(min(h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
 
-    def _draw_details_3col(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
-        # Three columns: Status | Last User Send | Last Claw Send
-        sep = 1
-        col1 = max(22, int(w * 0.34))
-        col2 = max(22, int(w * 0.33))
-        col3 = max(22, w - col1 - col2 - sep * 2)
-        if col3 < 22:
-            # Fallback: rebalance a bit
-            col1 = max(22, int(w * 0.33))
-            col2 = max(22, int(w * 0.33))
-            col3 = max(22, w - col1 - col2 - sep * 2)
-        x1 = x
-        x2 = x + col1 + sep
-        x3 = x2 + col2 + sep
-
-        # Separators
-        try:
-            stdscr.vline(y, x + col1, curses.ACS_VLINE, max(0, h))
-            stdscr.vline(y, x2 + col2, curses.ACS_VLINE, max(0, h))
-        except curses.error:
-            pass
-
-        # Column headers
+    def _draw_details_status_split3(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+        # Top status block spans width; bottom has 3 columns:
+        # Last User Send | Last Claw Send | Last Trigger
         status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
         user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         claw_attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
-        self._safe_addnstr(stdscr, y, x1, _fit("Status", col1).ljust(col1), col1, status_attr)
-        user_send = sv.tail.last_user_send
-        user_any = sv.tail.last_user
-        user_hdr = "Last User Send" if user_send else ("Last Trigger" if user_any else "Last User Send")
-        self._safe_addnstr(stdscr, y, x2, _fit(user_hdr, col2).ljust(col2), col2, user_attr)
-        self._safe_addnstr(stdscr, y, x3, _fit("Last Claw Send", col3).ljust(col3), col3, claw_attr)
+        trig_attr = curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
 
-        # Status column content
-        markers = _agent_markers(sv.meta)
-        mark_str = f" ({','.join(markers)})" if markers else ""
-        status_lines: List[str] = [
-            f"session: {sv.meta.key}",
-            f"agent: {sv.meta.agent_id}{mark_str}",
-            f"chan: {sv.meta.channel or '-'}  acct: {sv.meta.account_id or '-'}",
-        ]
-        if sv.meta.kind or sv.meta.chat_type:
-            status_lines.append(f"kind: {sv.meta.kind or '-'}")
-        status_lines.append(f"state: {sv.computed.state.value}")
-        status_lines.append(f"reason: {sv.computed.reason}")
-        if sv.lock:
-            status_lines.append(f"lock: pid={sv.lock.pid} alive={sv.lock.pid_alive}")
-            status_lines.append(f"      at {_fmt_dt(sv.lock.created_at)}")
-        else:
-            status_lines.append("lock: -")
-        if sv.delivery_failure:
-            status_lines.append(f"delivery: FAILED x{sv.delivery_failure.retry_count}")
-        if sv.computed.no_feedback:
-            status_lines.append("alert: NO_FEEDBACK")
-        if sv.computed.safety_alert:
-            status_lines.append("alert: SAFETY")
-        if sv.computed.safeguard_alert:
-            status_lines.append("alert: SAFEGUARD_OFF")
-
-        # Diagnosis (top few)
-        status_lines.append("")
-        status_lines.append("diagnosis:")
-        if sv.findings:
-            for f in sv.findings[:4]:
-                status_lines.append(f"- {f.severity} {f.id}")
-        else:
-            status_lines.append("- (none)")
-
-        # User column content
-        user_msg = user_send or user_any
-        user_lines: List[str] = []
-        if user_msg:
-            user_lines.append(f"at: {_fmt_dt(user_msg.ts)}")
-            user_lines.append("")
-            user_lines.extend(_wrap_lines(redact_text(user_msg.preview), max(0, col2 - 2), max_lines=max(1, h - 4)))
-        else:
-            user_lines.append("-")
-
-        # Assistant column content
-        asst_lines: List[str] = []
-        if sv.tail.last_assistant:
-            asst_lines.append(f"at: {_fmt_dt(sv.tail.last_assistant.ts)}")
-            asst_lines.append(f"stop: {sv.tail.last_assistant.stop_reason or '-'}")
-            asst_lines.append("")
-            asst_lines.extend(_wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col3 - 2), max_lines=max(1, h - 5)))
-        else:
-            asst_lines.append("-")
-
-        # Draw columns (start at y+1)
-        max_body = max(0, h - 1)
-        for i in range(min(max_body, len(status_lines))):
-            self._safe_addnstr(stdscr, y + 1 + i, x1, _fit(status_lines[i], col1), col1)
-        for i in range(min(max_body, len(user_lines))):
-            self._safe_addnstr(stdscr, y + 1 + i, x2, _fit(user_lines[i], col2), col2)
-        for i in range(min(max_body, len(asst_lines))):
-            self._safe_addnstr(stdscr, y + 1 + i, x3, _fit(asst_lines[i], col3), col3)
-
-    def _draw_details_3pane(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
-        # Three stacked panes: Status / Last User Send / Last Claw Send
-        status_h = max(6, min(12, h // 2))
-        remaining = max(0, h - status_h - 2)  # 2 separators
-        user_h = max(3, remaining // 2)
-        asst_h = max(3, remaining - user_h)
-
+        status_h = max(7, min(12, h // 2))
+        msg_h = max(0, h - status_h - 1)
         y_status = y
-        y_sep1 = y_status + status_h
-        y_user = y_sep1 + 1
-        y_sep2 = y_user + user_h
-        y_asst = y_sep2 + 1
+        y_sep = y_status + status_h
+        y_msgs = y_sep + 1
 
-        # separators
         try:
-            stdscr.hline(y_sep1, x, curses.ACS_HLINE, max(0, w))
-            stdscr.hline(y_sep2, x, curses.ACS_HLINE, max(0, w))
+            stdscr.hline(y_sep, x, curses.ACS_HLINE, max(0, w))
         except curses.error:
             pass
 
-        # STATUS pane
-        status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
-        user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
-        claw_attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        # Status header + lines
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
             f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
-        if sv.meta.kind or sv.meta.chat_type:
-            status_lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
-        status_lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
         if sv.lock:
             status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
         else:
             status_lines.append("Lock: -")
         if sv.delivery_failure:
             status_lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
-        flags: List[str] = []
+        alerts: List[str] = []
         if sv.computed.no_feedback:
-            flags.append("NO_FEEDBACK")
+            alerts.append("NO_FEEDBACK")
         if sv.computed.safety_alert:
-            flags.append("SAFETY")
+            alerts.append("SAFETY")
         if sv.computed.safeguard_alert:
-            flags.append("SAFEGUARD_OFF")
-        if flags:
-            status_lines.append("Alerts: " + ",".join(flags))
-        # Diagnosis short
+            alerts.append("SAFEGUARD_OFF")
+        if alerts:
+            status_lines.append("Alerts: " + ",".join(alerts))
         if sv.findings:
-            status_lines.append("Diagnosis: " + f"[{sv.findings[0].severity}] {sv.findings[0].id}")
+            status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
         else:
             status_lines.append("Diagnosis: (none)")
 
-        body_h = max(0, status_h - 1)
-        for i in range(min(body_h, len(status_lines))):
+        for i in range(min(status_h - 1, len(status_lines))):
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
 
-        # USER pane
-        user_send = sv.tail.last_user_send
-        user_any = sv.tail.last_user
-        user_hdr = "Last User Send" if user_send else ("Last Trigger (internal)" if user_any else "Last User Send")
-        self._safe_addnstr(stdscr, y_user, x, _fit(user_hdr, w), w, user_attr)
-        user_msg = user_send or user_any
-        if user_msg:
-            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(user_msg.ts)}", w), w)
-            msg_lines = _wrap_lines(redact_text(user_msg.preview), max(0, w), max_lines=max(0, user_h - 2))
+        if msg_h <= 2:
+            return
+
+        sep = 1
+        col = (w - 2 * sep) // 3
+        col1 = col
+        col2 = col
+        col3 = w - col1 - col2 - 2 * sep
+        x1 = x
+        x2 = x1 + col1 + sep
+        x3 = x2 + col2 + sep
+
+        try:
+            stdscr.vline(y_msgs, x1 + col1, curses.ACS_VLINE, max(0, msg_h))
+            stdscr.vline(y_msgs, x2 + col2, curses.ACS_VLINE, max(0, msg_h))
+        except curses.error:
+            pass
+
+        self._safe_addnstr(stdscr, y_msgs, x1, _fit("Last User Send", col1), col1, user_attr)
+        self._safe_addnstr(stdscr, y_msgs, x2, _fit("Last Claw Send", col2), col2, claw_attr)
+        self._safe_addnstr(stdscr, y_msgs, x3, _fit("Last Trigger", col3), col3, trig_attr)
+
+        # Body lines
+        user_lines: List[str] = ["-"]
+        if sv.tail.last_user_send:
+            user_lines = [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, col1), max_lines=msg_h - 2)
+        claw_lines: List[str] = ["-"]
+        if sv.tail.last_assistant:
+            claw_lines = [
+                f"@ {_fmt_dt(sv.tail.last_assistant.ts)}",
+                f"stop={sv.tail.last_assistant.stop_reason or '-'}",
+                "",
+            ] + _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col2), max_lines=msg_h - 3)
+        trig_lines: List[str] = ["-"]
+        if sv.tail.last_trigger:
+            trig_lines = [f"@ {_fmt_dt(sv.tail.last_trigger.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_trigger.preview), max(0, col3), max_lines=msg_h - 2)
+
+        body_h = msg_h - 1
+        for i in range(min(body_h, len(user_lines))):
+            self._safe_addnstr(stdscr, y_msgs + 1 + i, x1, _fit(user_lines[i], col1), col1)
+        for i in range(min(body_h, len(claw_lines))):
+            self._safe_addnstr(stdscr, y_msgs + 1 + i, x2, _fit(claw_lines[i], col2), col2)
+        for i in range(min(body_h, len(trig_lines))):
+            self._safe_addnstr(stdscr, y_msgs + 1 + i, x3, _fit(trig_lines[i], col3), col3)
+
+    def _draw_details_status_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+        # Stacked panes: Status / Last User Send / Last Claw Send / Last Trigger
+        status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        claw_attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        trig_attr = curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+
+        status_h = max(7, min(12, h // 2))
+        remaining = max(0, h - status_h - 3)  # 3 separators
+        pane_h = max(3, remaining // 3) if remaining else 3
+        user_h = pane_h
+        claw_h = pane_h
+        trig_h = max(3, remaining - user_h - claw_h) if remaining else 3
+
+        y_status = y
+        y_sep1 = y_status + status_h
+        y_user = y_sep1 + 1
+        y_sep2 = y_user + user_h
+        y_claw = y_sep2 + 1
+        y_sep3 = y_claw + claw_h
+        y_trig = y_sep3 + 1
+
+        try:
+            stdscr.hline(y_sep1, x, curses.ACS_HLINE, max(0, w))
+            stdscr.hline(y_sep2, x, curses.ACS_HLINE, max(0, w))
+            stdscr.hline(y_sep3, x, curses.ACS_HLINE, max(0, w))
+        except curses.error:
+            pass
+
+        # Status
+        self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
+        markers = _agent_markers(sv.meta)
+        mark_str = f" ({','.join(markers)})" if markers else ""
+        status_lines: List[str] = [
+            f"SessionKey: {sv.meta.key}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
+        ]
+        if sv.lock:
+            status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
+        else:
+            status_lines.append("Lock: -")
+        if sv.findings:
+            status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
+        for i in range(min(status_h - 1, len(status_lines))):
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+
+        # Last User Send
+        self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
+        if sv.tail.last_user_send:
+            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", w), w)
+            msg_lines = _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, w), max_lines=max(0, user_h - 2))
             for i, ln in enumerate(msg_lines[: max(0, user_h - 2)]):
                 self._safe_addnstr(stdscr, y_user + 2 + i, x, _fit(ln, w), w)
         else:
             self._safe_addnstr(stdscr, y_user + 1, x, _fit("-", w), w)
 
-        # ASSISTANT pane
-        self._safe_addnstr(stdscr, y_asst, x, _fit("Last Claw Send", w), w, claw_attr)
+        # Last Claw Send
+        self._safe_addnstr(stdscr, y_claw, x, _fit("Last Claw Send", w), w, claw_attr)
         if sv.tail.last_assistant:
-            self._safe_addnstr(stdscr, y_asst + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w), w)
-            msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, asst_h - 2))
-            for i, ln in enumerate(msg_lines[: max(0, asst_h - 2)]):
-                self._safe_addnstr(stdscr, y_asst + 2 + i, x, _fit(ln, w), w)
+            self._safe_addnstr(
+                stdscr,
+                y_claw + 1,
+                x,
+                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w),
+                w,
+            )
+            msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, claw_h - 2))
+            for i, ln in enumerate(msg_lines[: max(0, claw_h - 2)]):
+                self._safe_addnstr(stdscr, y_claw + 2 + i, x, _fit(ln, w), w)
         else:
-            self._safe_addnstr(stdscr, y_asst + 1, x, _fit("-", w), w)
+            self._safe_addnstr(stdscr, y_claw + 1, x, _fit("-", w), w)
+
+        # Last Trigger
+        self._safe_addnstr(stdscr, y_trig, x, _fit("Last Trigger", w), w, trig_attr)
+        if sv.tail.last_trigger:
+            self._safe_addnstr(stdscr, y_trig + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_trigger.ts)}", w), w)
+            msg_lines = _wrap_lines(redact_text(sv.tail.last_trigger.preview), max(0, w), max_lines=max(0, trig_h - 2))
+            for i, ln in enumerate(msg_lines[: max(0, trig_h - 2)]):
+                self._safe_addnstr(stdscr, y_trig + 2 + i, x, _fit(ln, w), w)
+        else:
+            self._safe_addnstr(stdscr, y_trig + 1, x, _fit("-", w), w)
 
     def _template_picker(self, stdscr: "curses._CursesWindow") -> Optional[str]:
         items = list(TEMPLATES.keys())

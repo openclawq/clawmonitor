@@ -76,7 +76,7 @@ def collect_status(
     for meta in metas:
         if hide_system_sessions and meta.system_sent:
             continue
-        tail = tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None)
+        tail = tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None, None)
         user_msg = tail.last_user_send or tail.last_user
         lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
         df = delivery_map.get(meta.key)

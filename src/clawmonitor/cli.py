@@ -149,7 +149,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not meta:
         raise SystemExit(f"Unknown sessionKey: {args.session_key}")
 
-    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None)
+    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None, None)
     user_msg = tail.last_user_send or tail.last_user
     lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
     delivery_map = load_failed_delivery_map(cfg.openclaw_root)
