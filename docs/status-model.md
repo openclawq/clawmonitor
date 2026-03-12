@@ -20,4 +20,5 @@ Per session, ClawMonitor tracks:
 - `NO_FEEDBACK`: no lock but last_user is newer than last_assistant (the “queue empty but no reply” problem)
 - `LONG_RUN`: lock exists and duration exceeds thresholds (default warn 15m, critical 60m)
 - `DELIVERY_FAILED`: there is a failed delivery record for the session key
-
+- `SAFETY`: last assistant stopReason hints safety/refusal/content_filter (heuristic)
+- `SAFEGUARD_OFF`: agent compaction mode is not `safeguard` (best-effort snapshot from `openclaw.json`)

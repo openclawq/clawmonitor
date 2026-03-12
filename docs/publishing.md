@@ -24,3 +24,7 @@ ClawMonitor is designed to be shareable:
 - phone numbers / user ids (when required)
 - internal hostnames / paths (if relevant)
 
+## Report sharing
+
+- Prefer exporting a redacted report: `clawmonitor report --session-key ... --format md` (or `both`).
+- Reports are written to `~/.local/state/clawmonitor/reports/` (XDG state dir), not into the repo.
