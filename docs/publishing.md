@@ -65,14 +65,14 @@ This repo already includes a workflow: `.github/workflows/pypi-publish.yml` (run
 To authorize it on PyPI (no secrets in the repo):
 
 1) Create a PyPI account (if you don’t have one).
-2) Create the project on PyPI:
+2) Create the project on PyPI (first publish), OR create a **Pending Publisher** for a new project.
    - Project name: `clawmonitor`
-3) In the PyPI project settings, add a “Trusted Publisher”:
+3) In the PyPI project settings (or “Publishing” → Pending Publishers), add a “Trusted Publisher”:
    - Provider: GitHub
    - Owner: `openclawq`
    - Repository: `clawmonitor`
    - Workflow filename: `pypi-publish.yml`
-   - Environment: (leave blank unless you set one)
+   - Environment: `pypi` (this repo’s workflow uses a GitHub Environment named `pypi`)
 4) After that, pushing a tag `vX.Y.Z` will publish automatically.
 
 If you prefer manual publishing instead, you can use a PyPI API token + `twine`, but trusted publishing is recommended.

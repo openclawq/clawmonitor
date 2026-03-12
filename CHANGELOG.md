@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- PyPI: trusted publishing workflow uses GitHub Environment `pypi` and supports manual `workflow_dispatch`.
+
 ## 0.1.2
 
 - Packaging: use SPDX `license = "MIT"` metadata (avoid setuptools deprecation warnings).
