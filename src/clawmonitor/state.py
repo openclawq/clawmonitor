@@ -42,10 +42,11 @@ def compute_state(
     long_run_warn_seconds: int = 15 * 60,
     long_run_crit_seconds: int = 60 * 60,
 ) -> SessionComputed:
-    last_user_ts = tail.last_user.ts if tail.last_user else None
+    user_msg = tail.last_user_send or tail.last_user
+    last_user_ts = user_msg.ts if user_msg else None
     last_assistant_ts = tail.last_assistant.ts if tail.last_assistant else None
 
-    no_user = tail.last_user is None
+    no_user = user_msg is None
     delivery_failed = delivery_failure is not None
 
     long_run_seconds: Optional[int] = None
