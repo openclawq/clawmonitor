@@ -14,6 +14,7 @@ from .gateway_logs import GatewayLogTailer
 from .init_wizard import maybe_run_first_time_init, run_init
 from .locks import lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
+from .push_notify import push_message
 from .redact import redact_text
 from .reports import write_report_files
 from .session_store import list_sessions
@@ -230,6 +231,65 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_push(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    metas = list_sessions(cfg.openclaw_root)
+    meta = next((m for m in metas if m.key == args.session_key), None)
+    if not meta:
+        raise SystemExit(f"Unknown sessionKey: {args.session_key}")
+    if not meta.channel or not meta.to:
+        raise SystemExit("Session is missing delivery context (channel/to); cannot push.")
+
+    # Compose a minimal monitor-generated status message (does NOT affect the session).
+    rows = collect_status(
+        openclaw_root=cfg.openclaw_root,
+        openclaw_bin=cfg.openclaw_bin,
+        transcript_tail_bytes=cfg.transcript_tail_bytes,
+        hide_system_sessions=False,
+        include_gateway_channels=not args.no_gateway,
+    )
+    row = next((r for r in rows if r.key == meta.key), None)
+    if not row:
+        raise SystemExit("Session not found in status collection.")
+
+    flags = ",".join(row.flags) if row.flags else "-"
+    msg = (
+        f"ClawMonitor: {row.state} flags={flags}\n"
+        f"userAge={row.user_age} asstAge={row.assistant_age} runFor={row.run_for}\n"
+        f"reason={row.reason}\n"
+        f"sessionKey={row.key}"
+    )
+    if args.message:
+        msg = args.message.strip() + "\n\n" + msg
+
+    res = push_message(
+        openclaw_bin=cfg.openclaw_bin,
+        channel=meta.channel,
+        account_id=meta.account_id,
+        target=meta.to,
+        message=msg,
+        dry_run=bool(args.dry_run),
+        silent=bool(args.silent),
+    )
+    elog = EventLog()
+    elog.write(
+        "push.sent",
+        sessionKey=meta.key,
+        channel=meta.channel,
+        accountId=meta.account_id or "",
+        to=meta.to,
+        ok=res.ok,
+        rc=res.returncode,
+    )
+    if args.json:
+        print(json.dumps({"ok": res.ok, "rc": res.returncode, "stdout": res.stdout, "stderr": res.stderr}, ensure_ascii=False, indent=2))
+    else:
+        print(f"ok={res.ok} rc={res.returncode}")
+        if res.stderr.strip():
+            print(res.stderr.strip())
+    return 0 if res.ok else 2
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="clawmonitor")
     p.add_argument("--config", help="Path to config.toml (default: ~/.config/clawmonitor/config.toml)")
@@ -282,6 +342,15 @@ def main() -> None:
     watch.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     watch.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     watch.set_defaults(func=cmd_watch)
+
+    push = sub.add_parser("push", help="Send a monitor-generated status message to the session's IM target (does not affect the session)")
+    push.add_argument("--session-key", required=True)
+    push.add_argument("--message", help="Optional prefix message (prepended)")
+    push.add_argument("--silent", action="store_true", help="Send without notification when supported (Telegram/Discord)")
+    push.add_argument("--dry-run", action="store_true", help="Do not send; print payload via openclaw")
+    push.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment while computing status")
+    push.add_argument("--json", action="store_true")
+    push.set_defaults(func=cmd_push)
 
     args = p.parse_args()
     if args.cmd != "init":

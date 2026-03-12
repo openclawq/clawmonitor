@@ -37,6 +37,8 @@ clawmonitor tui
 clawmonitor snapshot --format json
 clawmonitor snapshot --format md
 clawmonitor nudge --session-key 'agent:main:main' --template progress
+clawmonitor nudge --session-key 'agent:main:main' --template continue
+clawmonitor push --session-key 'agent:main:main' --dry-run
 clawmonitor status
 clawmonitor status --format json
 clawmonitor status --format md
@@ -77,4 +79,3 @@ clawmonitor watch --interval 1
 如果配置文件不存在，`clawmonitor tui/status/watch/...` 在交互式终端下会提示你运行初始化向导（非交互环境不会卡住）。
 
 更多介绍见：`docs/launch-post.md`。
-

@@ -30,6 +30,8 @@ Other commands:
 clawmonitor snapshot --format json
 clawmonitor snapshot --format md
 clawmonitor nudge --session-key 'agent:main:main' --template progress
+clawmonitor nudge --session-key 'agent:main:main' --template continue
+clawmonitor push --session-key 'agent:main:main' --dry-run
 clawmonitor status
 clawmonitor status --format json
 clawmonitor status --format md

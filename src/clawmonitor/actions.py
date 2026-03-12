@@ -11,6 +11,7 @@ TEMPLATES: Dict[str, str] = {
     "progress": "请用不超过8行汇报：当前进度、下一步、预估完成时间；已完成请写 DONE；受阻请写 BLOCKED: 原因。",
     "status": "只回复一个词：WORKING / DONE / BLOCKED，并补充1行原因或下一步。",
     "last_action": "请列出你最近一次工具/命令执行的名称与结果摘要（最多5行）。",
+    "continue": "继续完成你正在做/上次未完成的任务；如果正在运行长任务也不要中断，完成后汇报 DONE，并在过程中每隔10分钟用不超过6行汇报一次进度。",
 }
 
 
@@ -39,4 +40,3 @@ def send_nudge(openclaw_bin: str, session_key: str, template_id: str, deliver: b
     run_id = res.data.get("runId") if isinstance(res.data.get("runId"), str) else None
     status = res.data.get("status") if isinstance(res.data.get("status"), str) else None
     return NudgeResult(ok=True, run_id=run_id, status=status, error=None)
-
