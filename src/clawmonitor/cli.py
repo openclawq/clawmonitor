@@ -136,9 +136,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.format == "json":
         print(format_status_json(rows, cfg.openclaw_root))
     elif args.format == "md":
-        print(format_status_markdown(rows, limit=args.limit))
+        print(format_status_markdown(rows, limit=args.limit, detail=bool(args.detail)))
     else:
-        print(format_table(rows, limit=args.limit))
+        print(format_table(rows, limit=args.limit, detail=bool(args.detail)))
     return 0
 
 
@@ -324,6 +324,7 @@ def main() -> None:
     status = sub.add_parser("status", help="Print computed per-session core status (no curses)")
     status.add_argument("--format", choices=["text", "json", "md"], default="text")
     status.add_argument("--limit", type=int, help="Max sessions to print (text only)")
+    status.add_argument("--detail", action="store_true", help="Include task and message previews (text/md only)")
     status.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     status.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     status.set_defaults(func=cmd_status)

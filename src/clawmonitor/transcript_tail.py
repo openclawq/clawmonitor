@@ -33,11 +33,6 @@ def _extract_text(content: Any, max_chars: int = 400) -> str:
             text = item.get("text")
             if isinstance(text, str) and text.strip():
                 parts.append(text.strip())
-        elif t == "thinking":
-            # Avoid filling previews with long internal thoughts.
-            thinking = item.get("thinking")
-            if isinstance(thinking, str) and thinking.strip():
-                parts.append(f"[thinking] {thinking.strip()}")
     joined = " ".join(parts).strip()
     if not joined:
         return "<empty>"
