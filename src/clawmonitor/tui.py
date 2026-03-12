@@ -142,6 +142,31 @@ def _dt_from_ms(ms: Optional[int]) -> Optional[datetime]:
         return None
 
 
+def _channel_account_info(
+    channels: Optional[ChannelsSnapshot],
+    *,
+    channel: Optional[str],
+    account_id: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if not channels or not channel:
+        return None
+    chan = (channel or "").strip()
+    if not chan:
+        return None
+    acct = (account_id or "").strip() or (channels.raw.get("channelDefaultAccountId", {}) or {}).get(chan) or "default"
+    try:
+        accounts = (channels.raw.get("channelAccounts", {}) or {}).get(chan)
+        if isinstance(accounts, list):
+            for ent in accounts:
+                if not isinstance(ent, dict):
+                    continue
+                if str(ent.get("accountId") or "") == str(acct):
+                    return ent
+    except Exception:
+        return None
+    return None
+
+
 def _agent_markers(meta: SessionMeta) -> List[str]:
     markers: List[str] = []
     kind = ((meta.kind or "") + " " + (meta.chat_type or "")).lower()
@@ -587,6 +612,11 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
+        if acct_info:
+            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
+            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
+            status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
         if sv.telegram_binding:
             b = sv.telegram_binding
             note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
@@ -701,6 +731,11 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
+        if acct_info:
+            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
+            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
+            status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
         if sv.telegram_binding:
             b = sv.telegram_binding
             note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
