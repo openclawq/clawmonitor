@@ -81,7 +81,7 @@ If you prefer manual publishing instead, you can use a PyPI API token + `twine`,
 
 ClawMonitor itself is a standalone CLI. If you want it as an OpenClaw “skill”, the simplest approach is a wrapper skill that:
 
-- documents how to install `clawmonitor` (pip/pipx/uv)
+- documents how to install `clawmonitor` (pip)
 - provides small scripts like `clawmonitor_status.sh` / `clawmonitor_report.sh` that run:
   - `clawmonitor status --format md`
   - `clawmonitor report --session-key ... --format md`
