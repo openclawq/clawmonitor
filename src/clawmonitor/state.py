@@ -28,6 +28,14 @@ class SessionComputed:
     reason: str
 
 
+@dataclass(frozen=True)
+class WorkingSignal:
+    kind: str  # lock|acp|other
+    created_at: Optional[datetime]
+    pid: Optional[int] = None
+    pid_alive: Optional[bool] = None
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -39,6 +47,7 @@ def compute_state(
     delivery_failure: Optional[DeliveryFailure],
     *,
     safeguard_ok: bool = True,
+    working: Optional[WorkingSignal] = None,
     long_run_warn_seconds: int = 15 * 60,
     long_run_crit_seconds: int = 60 * 60,
 ) -> SessionComputed:
@@ -52,20 +61,22 @@ def compute_state(
     delivery_failed = delivery_failure is not None
 
     long_run_seconds: Optional[int] = None
-    if lock and lock.created_at:
-        long_run_seconds = int((_now() - lock.created_at).total_seconds())
+    work_created_at = lock.created_at if lock else (working.created_at if working else None)
+    if work_created_at:
+        long_run_seconds = int((_now() - work_created_at).total_seconds())
 
     # safety signals (heuristic)
     stop_reason = (tail.last_assistant.stop_reason if tail.last_assistant else None) or ""
     safety_alert = any(x in stop_reason.lower() for x in ["safety", "content_filter", "refusal"])
     safeguard_alert = not bool(safeguard_ok)
 
-    if lock:
-        reason = "lock present"
+    if lock or working:
+        base = "lock" if lock else (working.kind if working else "work")
+        reason = "lock present" if lock else f"{base} running"
         if long_run_seconds is not None and long_run_seconds >= long_run_crit_seconds:
-            reason = "long run (critical)"
+            reason = f"{base} long run (critical)"
         elif long_run_seconds is not None and long_run_seconds >= long_run_warn_seconds:
-            reason = "long run (warn)"
+            reason = f"{base} long run (warn)"
         return SessionComputed(
             state=WorkState.WORKING,
             no_feedback=False,

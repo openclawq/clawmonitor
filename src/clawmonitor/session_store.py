@@ -21,6 +21,10 @@ class SessionMeta:
     account_id: Optional[str]
     to: Optional[str]
     parent_session_key: Optional[str]
+    acp_state: Optional[str]
+    acpx_session_id: Optional[str]
+    acp_agent: Optional[str]
+    acp_identity_state: Optional[str]
 
 
 def _safe_int(v: Any) -> Optional[int]:
@@ -76,6 +80,24 @@ def list_sessions(openclaw_root: Path) -> List[SessionMeta]:
             account_id = delivery_context.get("accountId") or entry.get("lastAccountId") or (entry.get("origin", {}) or {}).get("accountId")
             to = delivery_context.get("to") or entry.get("lastTo")
             parent_session_key = entry.get("parentSessionKey")
+
+            acp_state: Optional[str] = None
+            acpx_session_id: Optional[str] = None
+            acp_agent: Optional[str] = None
+            acp_identity_state: Optional[str] = None
+            acp = entry.get("acp")
+            if isinstance(acp, dict):
+                st = acp.get("state")
+                acp_state = str(st) if isinstance(st, str) and st else None
+                ag = acp.get("agent")
+                acp_agent = str(ag) if isinstance(ag, str) and ag else None
+                ident = acp.get("identity")
+                if isinstance(ident, dict):
+                    sid = ident.get("acpxSessionId")
+                    acpx_session_id = str(sid) if isinstance(sid, str) and sid else None
+                    ist = ident.get("state")
+                    acp_identity_state = str(ist) if isinstance(ist, str) and ist else None
+
             out.append(
                 SessionMeta(
                     agent_id=agent_id,
@@ -91,6 +113,10 @@ def list_sessions(openclaw_root: Path) -> List[SessionMeta]:
                     account_id=str(account_id) if account_id is not None else None,
                     to=str(to) if to is not None else None,
                     parent_session_key=str(parent_session_key) if isinstance(parent_session_key, str) and parent_session_key else None,
+                    acp_state=acp_state,
+                    acpx_session_id=acpx_session_id,
+                    acp_agent=acp_agent,
+                    acp_identity_state=acp_identity_state,
                 )
             )
     out.sort(key=lambda s: (s.updated_at_ms or 0), reverse=True)

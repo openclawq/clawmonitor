@@ -7,13 +7,14 @@ Per session, ClawMonitor tracks:
 - **last_trigger**: newest internal/control-plane trigger message (if present)
 - **last_assistant**: last transcript message with `role=assistant` (preview + timestamp, stopReason)
 - **lock**: `sessionFile + ".lock"` (pid + createdAt) → indicates active run and run duration
+- **acpx (ACP sessions)**: when `sessions.json` has `acp.identity.acpxSessionId`, ClawMonitor may read `~/.acpx/sessions/<id>.json` to tail ACP messages and detect ACP runs even without JSONL locks
 - **abortedLastRun**: from `sessions.json`
 - **delivery failure**: from `delivery-queue/failed` entries keyed by `mirror.sessionKey`
 - **channel IO** (optional): `channels.status` lastInboundAt/lastOutboundAt for the channel account (Gateway online)
 
 ## Primary states
 
-- `WORKING`: lock file exists
+- `WORKING`: lock file exists, or an ACP session reports `acp.state in (running,pending)` (best-effort; may be enriched via ACPX)
 - `FINISHED`: no lock; last_assistant timestamp is >= last_user timestamp (when last_user exists)
 - `INTERRUPTED`: no lock; `abortedLastRun=true` and last_user is newer than last_assistant
 - `NO_MESSAGE`: no user message exists in transcript

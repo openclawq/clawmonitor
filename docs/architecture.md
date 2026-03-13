@@ -20,6 +20,11 @@ Telegram routing (local state):
 
 - Thread bindings (conversation → sessionKey): `~/.openclaw/telegram/thread-bindings-<accountId>.json`
 
+ACP sessions (local state, when enabled):
+
+- ACPX sessions (ACP backend runtime): `~/.acpx/sessions/<acpxSessionId>.json`
+  - Used to enrich ACP sessions that may not have a JSONL transcript file.
+
 ## Outputs
 
 - TUI: `clawmonitor tui` (tree view grouped by agent, color-coded rows, footer hotkeys, manual refresh and interval cycling)

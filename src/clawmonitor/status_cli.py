@@ -12,10 +12,11 @@ from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
 from .redact import redact_text
 from .session_keys import parse_session_key
+from .session_tail import tail_for_meta
 from .session_store import SessionMeta, list_sessions
-from .state import WorkState, compute_state
+from .state import WorkState, WorkingSignal, compute_state
 from .thread_bindings import load_telegram_thread_bindings
-from .transcript_tail import TranscriptTail, tail_transcript
+from .acpx_sessions import acpx_is_working
 
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
@@ -77,6 +78,11 @@ class StatusRow:
     last_user_preview: str
     last_assistant_preview: str
     reason: str
+    last_entry_type: str
+    assistant_model: str
+    assistant_provider: str
+    acp_state: str
+    acpx_session_id: str
 
 
 def collect_status(
@@ -96,11 +102,7 @@ def collect_status(
     for meta in metas:
         if hide_system_sessions and meta.system_sent:
             continue
-        tail = (
-            tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes)
-            if meta.session_file
-            else TranscriptTail(None, None, None, None, None, None, None)
-        )
+        tail, acpx = tail_for_meta(meta, transcript_tail_bytes=transcript_tail_bytes)
         user_msg = tail.last_user_send
         user_preview = redact_text(user_msg.preview) if user_msg else "-"
         assistant_preview = redact_text(tail.last_assistant.preview) if tail.last_assistant else "-"
@@ -108,7 +110,14 @@ def collect_status(
         df = delivery_map.get(meta.key)
         compaction_cfg = cfg_snapshot.compaction_by_agent.get(meta.agent_id) or cfg_snapshot.compaction_by_agent.get("main")
         safeguard_ok = (compaction_cfg.mode == "safeguard") if compaction_cfg and compaction_cfg.mode else False
-        computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
+        working: Optional[WorkingSignal] = None
+        if lock is None and meta.acp_state in ("running", "pending"):
+            if acpx is None:
+                working = WorkingSignal(kind="acp", created_at=_dt_from_ms(meta.updated_at_ms), pid=None, pid_alive=None)
+            elif acpx_is_working(acpx):
+                created_at = acpx.last_prompt_at or acpx.last_used_at or acpx.updated_at or _dt_from_ms(meta.updated_at_ms)
+                working = WorkingSignal(kind="acp", created_at=created_at, pid=acpx.pid, pid_alive=None)
+        computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok, working=working)
 
         flags: List[str] = []
         key_info = parse_session_key(meta.key)
@@ -119,10 +128,15 @@ def collect_status(
             flags.append("ACP")
         elif key_info.kind == "heartbeat":
             flags.append("HEARTBEAT")
+        if working and working.kind == "acp":
+            flags.append("ACP_RUNNING")
 
         agent_kind = "configured" if cfg_snapshot.configured_agent_ids.get(meta.agent_id, False) else "implicit"
         if agent_kind == "implicit":
             flags.append("IMPL_AGENT")
+        aid = (meta.agent_id or "").lower()
+        if aid == "codex" or aid.startswith("codex"):
+            flags.append("CODEX")
         if computed.no_feedback:
             flags.append("NO_FEEDBACK")
         if df:
@@ -143,18 +157,17 @@ def collect_status(
                 flags.append("BOUND_OTHER")
 
         run_for = "-"
-        if lock and lock.created_at:
-            run_for = _fmt_age(int((datetime.now(timezone.utc) - lock.created_at).total_seconds()))
+        run_at = lock.created_at if lock else (working.created_at if working else None)
+        if run_at:
+            run_for = _fmt_age(int((datetime.now(timezone.utc) - run_at).total_seconds()))
 
         updated_dt = _dt_from_ms(meta.updated_at_ms)
         transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
 
         task_preview = "-"
-        if lock:
-            # Best-effort "what is it working on right now?"
-            # Prefer strict inbound user text; fall back to last user role message.
-            src = tail.last_user_send
-            task_preview = redact_text(src.preview) if src else "-"
+        if computed.state == WorkState.WORKING:
+            src = tail.last_user_send or tail.last_trigger
+            task_preview = redact_text(src.preview) if src and src.preview else "-"
 
         rows.append(
             StatusRow(
@@ -178,6 +191,11 @@ def collect_status(
                 last_user_preview=user_preview[:120] if user_preview else "-",
                 last_assistant_preview=assistant_preview[:120] if assistant_preview else "-",
                 reason=computed.reason,
+                last_entry_type=tail.last_entry_type or "-",
+                assistant_model=(tail.last_assistant.model or "-") if tail.last_assistant else "-",
+                assistant_provider=(tail.last_assistant.provider or "-") if tail.last_assistant else "-",
+                acp_state=meta.acp_state or "-",
+                acpx_session_id=meta.acpx_session_id or "-",
             )
         )
     return rows
@@ -260,6 +278,11 @@ def format_json(rows: List[StatusRow], openclaw_root: Path) -> str:
                 "transcriptMissing": r.transcript_missing,
                 "lastUserAt": r.last_user_at,
                 "lastAssistantAt": r.last_assistant_at,
+                "lastEntryType": r.last_entry_type,
+                "assistantModel": r.assistant_model,
+                "assistantProvider": r.assistant_provider,
+                "acpState": r.acp_state,
+                "acpxSessionId": r.acpx_session_id,
                 "taskPreview": r.task_preview,
                 "lastUserPreview": r.last_user_preview,
                 "lastAssistantPreview": r.last_assistant_preview,

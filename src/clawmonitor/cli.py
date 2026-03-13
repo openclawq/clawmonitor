@@ -18,9 +18,10 @@ from .push_notify import push_message
 from .redact import redact_text
 from .reports import write_report_files
 from .session_store import list_sessions
-from .state import compute_state
+from .session_tail import tail_for_meta
+from .acpx_sessions import acpx_is_working
+from .state import WorkingSignal, compute_state
 from .status_cli import collect_status, format_json as format_status_json, format_markdown as format_status_markdown, format_table, watch_loop
-from .transcript_tail import TranscriptTail, tail_transcript
 from .tui import ClawMonitorTUI
 from .tree_cli import format_tree
 
@@ -75,6 +76,9 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 "sessionFile": str(s.session_file) if s.session_file else None,
                 "abortedLastRun": s.aborted_last_run,
                 "systemSent": s.system_sent,
+                "acpState": s.acp_state,
+                "acpxSessionId": s.acpx_session_id,
+                "acpAgent": s.acp_agent,
             }
             for s in sessions
         ],
@@ -150,11 +154,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not meta:
         raise SystemExit(f"Unknown sessionKey: {args.session_key}")
 
-    tail = (
-        tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes)
-        if meta.session_file
-        else TranscriptTail(None, None, None, None, None, None, None)
-    )
+    tail, acpx = tail_for_meta(meta, transcript_tail_bytes=cfg.transcript_tail_bytes)
     user_msg = tail.last_user_send or tail.last_user
     lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
     delivery_map = load_failed_delivery_map(cfg.openclaw_root)
@@ -163,7 +163,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     cfg_snapshot = read_openclaw_config_snapshot(cfg.openclaw_root)
     compaction_cfg = cfg_snapshot.compaction_by_agent.get(meta.agent_id) or cfg_snapshot.compaction_by_agent.get("main")
     safeguard_ok = (compaction_cfg.mode == "safeguard") if compaction_cfg and compaction_cfg.mode else False
-    computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
+    working: Optional[WorkingSignal] = None
+    if lock is None and acpx and meta.acp_state in ("running", "pending") and acpx_is_working(acpx):
+        created_at = acpx.last_prompt_at or acpx.last_used_at or acpx.updated_at
+        working = WorkingSignal(kind="acp", created_at=created_at, pid=acpx.pid, pid_alive=None)
+    computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok, working=working)
 
     gtail = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
     if not args.no_gateway:
@@ -192,10 +196,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         "safeguard_alert": computed.safeguard_alert,
         "aborted_last_run": meta.aborted_last_run,
         "system_sent": meta.system_sent,
+        "acp_state": meta.acp_state,
+        "acpx_session_id": meta.acpx_session_id,
+        "acp_agent": meta.acp_agent,
         "last_user_at": user_msg.ts.isoformat() if user_msg and user_msg.ts else None,
         "last_assistant_at": tail.last_assistant.ts.isoformat() if tail.last_assistant and tail.last_assistant.ts else None,
         "last_user_preview": redact_text(user_msg.preview) if user_msg else None,
         "last_assistant_preview": redact_text(tail.last_assistant.preview) if tail.last_assistant else None,
+        "last_entry_type": tail.last_entry_type,
+        "last_entry_at": tail.last_entry_ts.isoformat() if tail.last_entry_ts else None,
     }
 
     formats: List[str]

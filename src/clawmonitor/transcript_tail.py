@@ -39,6 +39,27 @@ def _extract_text(content: Any, max_chars: int = 400) -> str:
     return joined[:max_chars]
 
 
+_MARKER_PATTERN = re.compile(r"\[\[[^\]]*\]\]")
+_GATEWAY_TIME_PREFIX_PATTERN = re.compile(
+    r"^\[[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+GMT[^\]]*\]\s*"
+)
+
+
+def _strip_markers(text: str) -> str:
+    return _MARKER_PATTERN.sub("", text or "").strip()
+
+
+def _strip_gateway_time_prefix(text: str) -> str:
+    if not text:
+        return ""
+    return _GATEWAY_TIME_PREFIX_PATTERN.sub("", str(text), count=1).strip()
+
+
+def _clean_preview(text: str) -> str:
+    # Keep previews readable: drop gateway envelope prefix and internal markers.
+    return _strip_markers(_strip_gateway_time_prefix(text or ""))
+
+
 _INTERNAL_USER_PATTERNS = [
     re.compile(r"^Skills store policy\s*\(operator configured\):", re.IGNORECASE),
     re.compile(r"^Conversation info \(untrusted metadata\):", re.IGNORECASE),
@@ -100,20 +121,30 @@ def _extract_inbound_from_internal_wrapper(text: str) -> Optional[str]:
         return None
 
     lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-    for ln in reversed(lines[-20:]):
-        mm = _SENDER_LINE_RE.match(ln)
-        if not mm:
-            continue
-        sender = (mm.group(1) or "").strip()
-        msg = (mm.group(2) or "").strip()
-        if not msg:
-            continue
-        if sender.lower() in ("message_id", "sender_id", "sender", "timestamp", "current time", "system"):
-            continue
-        # If we have a sender_id, prefer matching it, otherwise accept any.
-        if sender_id and sender != sender_id:
-            continue
-        return msg
+    # Only use "sender_id: message" extraction when we actually know the sender_id.
+    # Otherwise, JSON metadata blocks may contain many ":" lines (e.g. `"label": ...`)
+    # which are not real inbound user text.
+    if sender_id:
+        for ln in reversed(lines[-20:]):
+            # Avoid mis-parsing gateway time envelopes like:
+            #   [Wed 2026-03-11 12:02 GMT+8] hello
+            # which contain ":" and would match sender-line regex.
+            if ln.startswith("[") and "GMT" in ln and "]" in ln:
+                continue
+            mm = _SENDER_LINE_RE.match(ln)
+            if not mm:
+                continue
+            sender = (mm.group(1) or "").strip()
+            msg = (mm.group(2) or "").strip()
+            if not msg:
+                continue
+            if sender.startswith("[") and "GMT" in sender:
+                continue
+            if sender.lower() in ("message_id", "sender_id", "sender", "timestamp", "current time", "system"):
+                continue
+            if sender != sender_id:
+                continue
+            return msg
 
     # Fallback: some wrappers append the real user message as a plain trailing
     # line/paragraph (no "sender_id: ..." prefix). Example:
@@ -156,6 +187,8 @@ class TailMessage:
     ts: Optional[datetime]
     preview: str
     stop_reason: Optional[str] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +204,8 @@ class TranscriptTail:
     last_assistant_thinking: Optional[str]
     last_tool_error: Optional[Tuple[Optional[datetime], str]]
     last_compaction_at: Optional[datetime]
+    last_entry_type: Optional[str] = None
+    last_entry_ts: Optional[datetime] = None
 
 
 def _extract_thinking(content: Any, max_chars: int = 400) -> str:
@@ -231,12 +266,18 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     last_assistant_thinking: Optional[str] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
     last_compaction_at: Optional[datetime] = None
+    last_entry_type: Optional[str] = None
+    last_entry_ts: Optional[datetime] = None
 
     for ln in reversed(lines):
         try:
             obj = json.loads(ln)
         except Exception:
             continue
+
+        if isinstance(obj, dict) and last_entry_type is None:
+            last_entry_type = str(obj.get("type")) if obj.get("type") is not None else None
+            last_entry_ts = _parse_iso(obj.get("timestamp"))
 
         if isinstance(obj, dict) and obj.get("type") == "compaction" and last_compaction_at is None:
             last_compaction_at = _parse_iso(obj.get("timestamp"))
@@ -266,7 +307,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
 
         if role == "user":
             raw = _extract_text(msg.get("content"), max_chars=8000)
-            preview = raw[:400] if raw else ""
+            preview = _clean_preview(raw[:400] if raw else "")
             if last_user is None:
                 last_user = TailMessage(role="user", ts=ts, preview=preview)
             if last_trigger is None and _is_internal_user_text(raw):
@@ -275,7 +316,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
                 if _is_internal_user_text(raw):
                     extracted = _extract_inbound_from_internal_wrapper(raw)
                     if extracted:
-                        last_user_send = TailMessage(role="user", ts=ts, preview=extracted[:400])
+                        last_user_send = TailMessage(role="user", ts=ts, preview=_clean_preview(extracted[:400]))
                 else:
                     last_user_send = TailMessage(role="user", ts=ts, preview=preview)
             continue
@@ -283,11 +324,15 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         if role == "assistant" and last_assistant is None:
             stop_reason = msg.get("stopReason")
             thinking = _extract_thinking(msg.get("content"), max_chars=400)
+            model = msg.get("model")
+            provider = msg.get("provider")
             last_assistant = TailMessage(
                 role="assistant",
                 ts=ts,
-                preview=_extract_text(msg.get("content")),
+                preview=_clean_preview(_extract_text(msg.get("content"))),
                 stop_reason=str(stop_reason) if stop_reason is not None else None,
+                model=str(model) if isinstance(model, str) and model.strip() else None,
+                provider=str(provider) if isinstance(provider, str) and provider.strip() else None,
             )
             last_assistant_thinking = thinking or None
             continue
@@ -305,4 +350,6 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         last_assistant_thinking=last_assistant_thinking,
         last_tool_error=last_tool_error,
         last_compaction_at=last_compaction_at,
+        last_entry_type=last_entry_type,
+        last_entry_ts=last_entry_ts,
     )

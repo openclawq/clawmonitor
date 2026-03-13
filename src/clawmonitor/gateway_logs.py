@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import json
+import threading
 
 from .openclaw_cli import gateway_call
 from .redact import redact_text
@@ -93,37 +94,50 @@ class GatewayLogTailer:
         self._lines: List[GatewayLogLine] = []
         self._available = True
         self._last_error: Optional[str] = None
+        self._lock = threading.Lock()
 
     @property
     def available(self) -> bool:
-        return self._available
+        with self._lock:
+            return self._available
 
     @property
     def last_error(self) -> Optional[str]:
-        return self._last_error
+        with self._lock:
+            return self._last_error
 
     @property
     def lines(self) -> List[GatewayLogLine]:
-        return list(self._lines)
+        with self._lock:
+            return list(self._lines)
+
+    @property
+    def line_count(self) -> int:
+        with self._lock:
+            return len(self._lines)
 
     def poll(self, limit: int = 200) -> None:
-        if not self._available:
-            return
+        with self._lock:
+            if not self._available:
+                return
+            cursor = self._cursor
+
         params: Dict[str, Any] = {"limit": limit, "maxBytes": 1_000_000}
-        if self._cursor is not None:
-            params["cursor"] = self._cursor
+        if cursor is not None:
+            params["cursor"] = cursor
+
         res = gateway_call(self._openclaw_bin, "logs.tail", params=params, timeout_ms=10000)
         if not res.ok or not res.data:
-            self._available = False
-            self._last_error = f"logs.tail unavailable (rc={res.returncode})"
+            with self._lock:
+                self._available = False
+                self._last_error = f"logs.tail unavailable (rc={res.returncode})"
             return
         data = res.data
         cursor = data.get("cursor")
-        if isinstance(cursor, int):
-            self._cursor = cursor
         lines = data.get("lines")
         if not isinstance(lines, list):
             return
+        parsed_lines: List[GatewayLogLine] = []
         for raw_line in lines:
             if not isinstance(raw_line, str):
                 continue
@@ -143,7 +157,11 @@ class GatewayLogTailer:
                 )
             else:
                 entry = GatewayLogLine(ts=None, subsystem=None, level=None, text=redact_text(raw_line), raw=redact_text(raw_line))
-            self._lines.append(entry)
-        if len(self._lines) > self._ring_lines:
-            self._lines = self._lines[-self._ring_lines :]
+            parsed_lines.append(entry)
 
+        with self._lock:
+            if isinstance(cursor, int):
+                self._cursor = cursor
+            self._lines.extend(parsed_lines)
+            if len(self._lines) > self._ring_lines:
+                self._lines = self._lines[-self._ring_lines :]

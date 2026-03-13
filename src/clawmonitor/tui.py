@@ -4,12 +4,56 @@ import curses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 import time
 import re
+import threading
 import unicodedata
+import os
+
+def _load_loading_art_lines() -> List[str]:
+    """
+    Load the TUI loading splash art.
+
+    Precedence:
+      1) $CLAWMONITOR_LOADING_ART (if set)
+      2) docs/loadingart.txt in a source checkout (editable installs)
+      3) packaged resource clawmonitor.assets/loadingart.txt
+      4) small built-in fallback
+    """
+    env_path = os.environ.get("CLAWMONITOR_LOADING_ART", "").strip()
+    if env_path:
+        try:
+            p = Path(env_path).expanduser()
+            if p.exists():
+                return p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            pass
+
+    # Try to locate docs/loadingart.txt in a source tree (best-effort).
+    try:
+        here = Path(__file__).resolve()
+        for parent in list(here.parents)[:6]:
+            cand = parent / "docs" / "loadingart.txt"
+            if cand.exists():
+                return cand.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        pass
+
+    try:
+        import importlib.resources as resources
+
+        art = resources.files("clawmonitor.assets").joinpath("loadingart.txt").read_text(encoding="utf-8")
+        return art.splitlines()
+    except Exception:
+        return [
+            "ClawMonitor",
+            "",
+            "loading…",
+        ]
 
 from .actions import TEMPLATES, send_nudge
+from .acpx_sessions import AcpxSnapshot, acpx_is_working, acpx_session_path, load_acpx_snapshot, tail_acpx_messages
 from .channels_status import ChannelsSnapshot, fetch_channels_status
 from .config import Config
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
@@ -22,7 +66,7 @@ from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
-from .state import SessionComputed, WorkState, compute_state
+from .state import SessionComputed, WorkState, WorkingSignal, compute_state
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
 
@@ -313,6 +357,8 @@ class SessionView:
     meta: SessionMeta
     tail: TranscriptTail
     lock: Optional[LockInfo]
+    working: Optional[WorkingSignal]
+    acpx: Optional[AcpxSnapshot]
     delivery_failure: Optional[DeliveryFailure]
     computed: SessionComputed
     findings: List[Finding]
@@ -327,7 +373,10 @@ class MonitorModel:
         self.cfg = cfg
         self.elog = elog
         self._sessions: List[SessionView] = []
+        self._sessions_lock = threading.Lock()
         self._tail_cache: Dict[Path, Tuple[float, int, TranscriptTail]] = {}
+        self._acpx_cache: Dict[Path, Tuple[float, int, Optional[AcpxSnapshot], TranscriptTail]] = {}
+        self._tail_key_cache: Dict[str, Tuple[Optional[int], Optional[str], float, TranscriptTail]] = {}
         self._delivery_map: Dict[str, DeliveryFailure] = {}
         self._delivery_last_load = 0.0
         self._gateway_logs = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
@@ -345,15 +394,18 @@ class MonitorModel:
 
     @property
     def channels(self) -> Optional[ChannelsSnapshot]:
-        return self._channels
+        with self._sessions_lock:
+            return self._channels
 
     @property
     def config_snapshot(self) -> Optional[OpenClawConfigSnapshot]:
-        return self._cfg_snapshot
+        with self._sessions_lock:
+            return self._cfg_snapshot
 
     @property
     def sessions(self) -> List[SessionView]:
-        return list(self._sessions)
+        with self._sessions_lock:
+            return list(self._sessions)
 
     def _refresh_delivery_map(self) -> None:
         now = time.time()
@@ -374,8 +426,9 @@ class MonitorModel:
         if now - self._channels_last_poll < self.cfg.channels_status_poll_seconds:
             return
         snap = fetch_channels_status(self.cfg.openclaw_bin, probe=False, timeout_ms=10000)
-        self._channels = snap
-        self._channels_last_poll = now
+        with self._sessions_lock:
+            self._channels = snap
+            self._channels_last_poll = now
 
     def _tail_for(self, session_file: Optional[Path]) -> TranscriptTail:
         if not session_file:
@@ -391,6 +444,22 @@ class MonitorModel:
             return tail
         except Exception:
             return TranscriptTail(None, None, None, None, None, None, None)
+
+    def _acpx_tail_for(self, acpx_session_id: str) -> Tuple[Optional[AcpxSnapshot], TranscriptTail]:
+        path = acpx_session_path(acpx_session_id)
+        if not path.exists():
+            return None, TranscriptTail(None, None, None, None, None, None, None)
+        try:
+            st = path.stat()
+            cached = self._acpx_cache.get(path)
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                return cached[2], cached[3]
+            snap, doc = load_acpx_snapshot(acpx_session_id)
+            tail = tail_acpx_messages(doc) if doc else TranscriptTail(None, None, None, None, None, None, None)
+            self._acpx_cache[path] = (st.st_mtime, st.st_size, snap, tail)
+            return snap, tail
+        except Exception:
+            return None, TranscriptTail(None, None, None, None, None, None, None)
 
     def _refresh_telegram_bindings(self) -> None:
         # Lightweight local file read; throttle to avoid needless IO.
@@ -408,10 +477,34 @@ class MonitorModel:
         if now - self._cfg_snapshot_last_load < 2.0:
             return
         try:
-            self._cfg_snapshot = read_openclaw_config_snapshot(self.cfg.openclaw_root)
+            snap = read_openclaw_config_snapshot(self.cfg.openclaw_root)
         except Exception:
-            self._cfg_snapshot = None
-        self._cfg_snapshot_last_load = now
+            snap = None
+        with self._sessions_lock:
+            self._cfg_snapshot = snap
+            self._cfg_snapshot_last_load = now
+
+    def _tail_for_meta(self, meta: SessionMeta, *, lock_present: bool) -> TranscriptTail:
+        """
+        Avoid re-statting/re-reading JSONL on every refresh by using sessions.json
+        updatedAt as a cheap change detector.
+        """
+        key = meta.key
+        updated = meta.updated_at_ms
+        path_str = str(meta.session_file) if meta.session_file else None
+        cached = self._tail_key_cache.get(key)
+        now = time.time()
+        if cached:
+            last_updated, last_path, last_tailed_at, tail = cached
+            if last_updated == updated and last_path == path_str:
+                if not lock_present:
+                    return tail
+                # When working, re-tail with a small TTL to keep "last assistant" fresh.
+                if now - last_tailed_at < 3.0:
+                    return tail
+        tail = self._tail_for(meta.session_file)
+        self._tail_key_cache[key] = (updated, path_str, now, tail)
+        return tail
 
     def _telegram_binding_for(self, *, account_id: Optional[str], to: Optional[str]) -> Optional[TelegramThreadBinding]:
         if not to or not isinstance(to, str) or not to.startswith("telegram:"):
@@ -422,38 +515,54 @@ class MonitorModel:
         aid = (account_id or "default").strip() or "default"
         return (self._telegram_bindings.get(aid) or {}).get(conv_id)
 
-    def refresh(self) -> None:
+    def refresh(self, *, progress: Optional[Callable[[str, int, int], None]] = None) -> None:
+        def tick(msg: str, i: int, total: int) -> None:
+            if progress:
+                progress(msg, i, total)
+
+        tick("Loading delivery queue…", 1, 7)
         self._refresh_delivery_map()
+        tick("Tailing gateway logs…", 2, 7)
         self._refresh_gateway_logs()
+        tick("Reading channels status…", 3, 7)
         self._refresh_channels()
+        tick("Loading telegram bindings…", 4, 7)
         self._refresh_telegram_bindings()
+        tick("Reading openclaw.json…", 5, 7)
         self._refresh_config_snapshot()
 
+        tick("Listing sessions…", 6, 7)
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
-        for meta in metas:
+        total = max(1, len(metas))
+        for idx, meta in enumerate(metas):
             if self.cfg.hide_system_sessions and meta.system_sent:
                 continue
-            tail = self._tail_for(meta.session_file)
+            if progress and (idx % 12 == 0):
+                tick(f"Tailing transcripts… ({idx+1}/{total})", 7, 7)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
+            acpx: Optional[AcpxSnapshot] = None
+            tail = self._tail_for_meta(meta, lock_present=bool(lock))
+            if (not meta.session_file or not meta.session_file.exists()) and meta.acpx_session_id:
+                acpx, tail = self._acpx_tail_for(meta.acpx_session_id)
             df = self._delivery_map.get(meta.key)
             safeguard_ok = True
             try:
-                if self._cfg_snapshot:
-                    compaction_cfg = self._cfg_snapshot.compaction_by_agent.get(meta.agent_id) or self._cfg_snapshot.compaction_by_agent.get("main")
+                snap = self.config_snapshot
+                if snap:
+                    compaction_cfg = snap.compaction_by_agent.get(meta.agent_id) or snap.compaction_by_agent.get("main")
                     safeguard_ok = bool(compaction_cfg and compaction_cfg.mode == "safeguard")
             except Exception:
                 safeguard_ok = True
-            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
-            findings = diagnose(
-                session_key=meta.key,
-                channel=meta.channel,
-                account_id=meta.account_id,
-                delivery_failed=df is not None,
-                no_feedback=computed.no_feedback,
-                is_working=computed.state == WorkState.WORKING,
-                gateway_lines=self._gateway_logs.lines,
-            )
+            working: Optional[WorkingSignal] = None
+            if lock is None and meta.acp_state in ("running", "pending"):
+                if acpx is None:
+                    working = WorkingSignal(kind="acp", created_at=_dt_from_ms(meta.updated_at_ms), pid=None, pid_alive=None)
+                elif acpx_is_working(acpx):
+                    created_at = acpx.last_prompt_at or acpx.last_used_at or acpx.updated_at or _dt_from_ms(meta.updated_at_ms)
+                    working = WorkingSignal(kind="acp", created_at=created_at, pid=acpx.pid, pid_alive=None)
+            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok, working=working)
+            findings: List[Finding] = []
             transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
             telegram_binding: Optional[TelegramThreadBinding] = None
             telegram_routed_elsewhere = False
@@ -466,6 +575,8 @@ class MonitorModel:
                     meta=meta,
                     tail=tail,
                     lock=lock,
+                    working=working,
+                    acpx=acpx,
                     delivery_failure=df,
                     computed=computed,
                     findings=findings,
@@ -475,7 +586,8 @@ class MonitorModel:
                     telegram_routed_elsewhere=telegram_routed_elsewhere,
                 )
             )
-        self._sessions = views
+        with self._sessions_lock:
+            self._sessions = views
 
 
 @dataclass(frozen=True)
@@ -501,6 +613,7 @@ class ClawMonitorTUI:
         self.cfg = cfg
         self.elog = EventLog()
         self.model = MonitorModel(cfg, self.elog)
+        self._loading_art_lines = _load_loading_art_lines()
         self.selected = 0
         self.scroll = 0
         self.selected_session_key: Optional[str] = None
@@ -514,9 +627,74 @@ class ClawMonitorTUI:
         self._color_idle = 0
         self._color_alert = 0
         self._color_magenta = 0
+        self._refresh_lock = threading.Lock()
+        self._refresh_in_progress = False
+        self._refresh_pending = False
+        self._refresh_started_at: Optional[float] = None
+        self._refresh_progress_msg: str = ""
+        self._refresh_progress_step: int = 0
+        self._refresh_progress_total: int = 0
+        self._refresh_error: Optional[str] = None
+        self._rel_cache_session_key: Optional[str] = None
+        self._rel_cache_log_count: int = -1
+        self._rel_cache_lines: List[str] = []
+        self._rel_cache_last_activity: Optional[str] = None
 
     def run(self) -> None:
         curses.wrapper(self._main)
+
+    def _set_refresh_progress(self, msg: str, step: int, total: int) -> None:
+        with self._refresh_lock:
+            self._refresh_progress_msg = msg
+            self._refresh_progress_step = step
+            self._refresh_progress_total = total
+
+    def _refresh_worker(self) -> None:
+        try:
+            self.model.refresh(progress=self._set_refresh_progress)
+            err = None
+        except Exception as e:
+            err = str(e)
+        with self._refresh_lock:
+            self._refresh_in_progress = False
+            self._refresh_error = err
+            self._last_refresh_at = time.time()
+            if self._refresh_pending:
+                self._refresh_pending = False
+                # Allow immediate next refresh; main loop will start it.
+
+    def _request_refresh(self) -> None:
+        with self._refresh_lock:
+            if self._refresh_in_progress:
+                self._refresh_pending = True
+                return
+            self._refresh_in_progress = True
+            self._refresh_started_at = time.time()
+            self._refresh_error = None
+            self._refresh_progress_msg = "Refreshing…"
+            self._refresh_progress_step = 0
+            self._refresh_progress_total = 0
+        t = threading.Thread(target=self._refresh_worker, name="clawmonitor-refresh", daemon=True)
+        t.start()
+
+    def _related_logs_cached(self, sv: SessionView) -> Tuple[List[str], Optional[str]]:
+        if not self.show_logs:
+            return [], None
+        session_key = sv.meta.key
+        log_count = self.model.gateway_log_tailer.line_count
+        if self._rel_cache_session_key == session_key and self._rel_cache_log_count == log_count:
+            return self._rel_cache_lines, self._rel_cache_last_activity
+        rel = related_logs(self.model.gateway_log_tailer.lines, session_key, sv.meta.channel, sv.meta.account_id, limit=50)
+        rel_lines = [ln.text for ln in rel][-20:]
+        last_activity: Optional[str] = None
+        if rel:
+            ln = rel[-1]
+            last_activity = (ln.text or ln.raw or "").strip()
+        self._rel_cache_session_key = session_key
+        self._rel_cache_log_count = log_count
+        self._rel_cache_lines = rel_lines
+        self._rel_cache_last_activity = last_activity
+        return rel_lines, last_activity
 
     def _agent_kind(self, agent_id: str) -> str:
         snap = self.model.config_snapshot
@@ -544,6 +722,9 @@ class ClawMonitorTUI:
         info = parse_session_key(sv.meta.key)
         if info.kind == "channel":
             return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        if info.kind == "acp":
+            st = (sv.meta.acp_state or "").strip()
+            return f"acp:{st}" if st else "acp"
         return info.kind
 
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
@@ -684,6 +865,55 @@ class ClawMonitorTUI:
         except curses.error:
             return
 
+    def _draw_loading(
+        self,
+        stdscr: "curses._CursesWindow",
+        *,
+        msg: str,
+        step: int,
+        total_steps: int,
+        started_at: float,
+    ) -> None:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+
+        art = list(self._loading_art_lines or [])
+        # Keep enough vertical space for progress + footer notes.
+        max_art_h = max(0, h - 8)
+        if max_art_h and len(art) > max_art_h:
+            # Prefer keeping the "shrimp" block visible on small terminals.
+            shrimp_start = None
+            for i, ln in enumerate(art):
+                if any(ch in ln for ch in ("⣀", "⣿", "⠀⠀")):
+                    shrimp_start = i
+                    break
+            if shrimp_start is not None:
+                art = art[shrimp_start : shrimp_start + max_art_h]
+            else:
+                art = art[:max_art_h]
+        block_h = len(art) + 6
+        y0 = max(0, (h - block_h) // 2)
+        for i, ln in enumerate(art):
+            ln = ln.rstrip("\n")
+            ln_w = _display_width(ln)
+            x0 = 0 if ln_w >= w - 2 else max(0, (w - ln_w) // 2)
+            self._safe_addnstr(stdscr, y0 + i, x0, ln, max(0, w - 2))
+
+        step = max(0, min(total_steps, step))
+        ratio = (step / max(1, total_steps)) if total_steps else 0.0
+        bar_w = max(10, min(60, w - 10))
+        fill = int(bar_w * ratio)
+        bar = "[" + ("#" * fill).ljust(bar_w, ".") + "]"
+        elapsed = int(max(0.0, time.time() - started_at))
+        info = f"{bar}  {step}/{total_steps}  {elapsed}s"
+
+        self._safe_addnstr(stdscr, y0 + len(art) + 1, max(0, (w - len(info)) // 2), info, max(0, w - 2))
+        self._safe_addnstr(stdscr, y0 + len(art) + 3, 2, f"OpenClaw: {self.cfg.openclaw_root}", max(0, w - 4))
+        self._safe_addnstr(stdscr, y0 + len(art) + 4, 2, f"Phase: {msg}", max(0, w - 4))
+        self._safe_addnstr(stdscr, h - 2, 2, "Loading… (initial refresh can take a few seconds if Gateway calls are slow)", max(0, w - 4))
+        self._safe_addnstr(stdscr, h - 1, 2, "Tip: later you can press [r] to refresh and [?] for help.", max(0, w - 4))
+        stdscr.refresh()
+
     def _draw_header(self, stdscr: "curses._CursesWindow", width: int) -> None:
         channels = self.model.channels
         mode = "online" if self.model.gateway_log_tailer.available else "offline"
@@ -725,8 +955,9 @@ class ClawMonitorTUI:
             u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
-            if sv.lock and sv.lock.created_at:
-                run = _fmt_age(int((datetime.now(timezone.utc) - sv.lock.created_at).total_seconds()))
+            run_at = sv.lock.created_at if sv.lock else (sv.working.created_at if sv.working else None)
+            if run_at:
+                run = _fmt_age(int((datetime.now(timezone.utc) - run_at).total_seconds()))
             flags: List[str] = []
             health_cls = _health_class(
                 state=sv.computed.state,
@@ -742,6 +973,8 @@ class ClawMonitorTUI:
                 flags.append("DLV")
             if sv.lock and sv.lock.pid_alive is False:
                 flags.append("ZLOCK")
+            if sv.working and sv.working.kind == "acp":
+                flags.append("ACPRUN")
             if sv.computed.safety_alert:
                 flags.append("SAFE")
             if sv.transcript_missing:
@@ -765,14 +998,7 @@ class ClawMonitorTUI:
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
         if not sv:
             return
-        rel_logs: List[str] = []
-        last_activity: Optional[str] = None
-        if self.show_logs:
-            rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
-            rel_logs = [ln.text for ln in rel][-20:]
-            if rel:
-                ln = rel[-1]
-                last_activity = (ln.text or ln.raw or "").strip()
+        rel_logs, last_activity = self._related_logs_cached(sv)
 
         log_budget = 0
         if self.show_logs:
@@ -888,13 +1114,25 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
+        key_info = parse_session_key(sv.meta.key)
+        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.tail.last_entry_type:
+            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
+        if sv.acpx and sv.meta.acpx_session_id:
+            st = sv.meta.acp_state or "-"
+            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
+            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
+        if sv.working and not sv.lock:
+            status_lines.append(
+                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
+            )
         # Task summary (best-effort): show what the agent is working on right now.
         if sv.lock:
             task_src = sv.tail.last_user_send
@@ -902,6 +1140,18 @@ class ClawMonitorTUI:
                 status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
                 status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
+                status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
+        elif sv.working:
+            task_src = sv.tail.last_user_send or sv.tail.last_trigger
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
@@ -976,9 +1226,11 @@ class ClawMonitorTUI:
             user_lines = [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, col1), max_lines=msg_h - 2)
         claw_lines: List[str] = ["-"]
         if sv.tail.last_assistant:
+            model = sv.tail.last_assistant.model or "-"
+            provider = sv.tail.last_assistant.provider or "-"
             claw_lines = [
                 f"@ {_fmt_dt(sv.tail.last_assistant.ts)}",
-                f"stop={sv.tail.last_assistant.stop_reason or '-'}",
+                f"stop={sv.tail.last_assistant.stop_reason or '-'}  model={provider}/{model}" if (model != "-" or provider != "-") else f"stop={sv.tail.last_assistant.stop_reason or '-'}",
                 "",
             ] + _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col2), max_lines=msg_h - 3)
         trig_lines: List[str] = ["-"]
@@ -1036,19 +1288,44 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
+        key_info = parse_session_key(sv.meta.key)
+        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.tail.last_entry_type:
+            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
+        if sv.acpx and sv.meta.acpx_session_id:
+            st = sv.meta.acp_state or "-"
+            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
+            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
+        if sv.working and not sv.lock:
+            status_lines.append(
+                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
+            )
         if sv.lock:
             task_src = sv.tail.last_user_send
             if task_src and task_src.preview:
                 status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
                 status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                status_lines.extend(
+                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
+                )
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
+        elif sv.working:
+            task_src = sv.tail.last_user_send or sv.tail.last_trigger
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             if sv.tail.last_assistant_thinking:
                 status_lines.extend(
                     _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
@@ -1095,11 +1372,14 @@ class ClawMonitorTUI:
         # Last Claw Send
         self._safe_addnstr(stdscr, y_claw, x, _fit("Last Claw Send", w), w, claw_attr)
         if sv.tail.last_assistant:
+            model = sv.tail.last_assistant.model or "-"
+            provider = sv.tail.last_assistant.provider or "-"
+            model_str = f"  model={provider}/{model}" if (model != "-" or provider != "-") else ""
             self._safe_addnstr(
                 stdscr,
                 y_claw + 1,
                 x,
-                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w),
+                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}{model_str}", w),
                 w,
             )
             msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, claw_h - 2))
@@ -1171,6 +1451,10 @@ class ClawMonitorTUI:
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
             "  d              Re-run diagnosis (forces refresh)",
+            "",
+            "Performance:",
+            "  - Refresh runs asynchronously; footer shows refresh progress/errors.",
+            "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
             "",
             "Left list columns:",
             "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
@@ -1267,15 +1551,22 @@ class ClawMonitorTUI:
             self._colors_enabled = False
         stdscr.timeout(200)
         stdscr.keypad(True)
-        last_refresh = 0.0
+        started_at = time.time()
+        self._draw_loading(stdscr, msg="Starting…", step=0, total_steps=7, started_at=started_at)
+        # Initial refresh can block on slow Gateway calls; show progress in the splash.
+        self.model.refresh(progress=lambda m, i, t: self._draw_loading(stdscr, msg=m, step=i, total_steps=t, started_at=started_at))
+        last_refresh = time.time()
+        self._last_refresh_at = last_refresh
         dirty = True
         while True:
             now = time.time()
-            if now - last_refresh >= self.refresh_seconds:
-                self.model.refresh()
-                last_refresh = now
-                self._last_refresh_at = now
-                dirty = True
+            # Async refresh: keep UI responsive even if Gateway calls are slow.
+            if self._last_refresh_at is None or (now - self._last_refresh_at >= self.refresh_seconds):
+                with self._refresh_lock:
+                    in_prog = self._refresh_in_progress
+                if not in_prog:
+                    self._request_refresh()
+                    dirty = True
 
             sessions = self.model.sessions
             items = self._build_list_items(sessions)
@@ -1300,8 +1591,8 @@ class ClawMonitorTUI:
                 self._move_selection(items, 1)
                 dirty = True
             elif ch == ord("r"):
-                self.model.refresh()
-                self._last_refresh_at = time.time()
+                self._request_refresh()
+                last_refresh = time.time()
                 dirty = True
             elif ch == ord("l"):
                 self.show_logs = not self.show_logs
@@ -1381,6 +1672,12 @@ class ClawMonitorTUI:
             refresh_age = "-"
             if self._last_refresh_at is not None:
                 refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
+            with self._refresh_lock:
+                in_prog = self._refresh_in_progress
+                prog_msg = self._refresh_progress_msg
+                prog_step = self._refresh_progress_step
+                prog_total = self._refresh_progress_total
+                err = self._refresh_error
             selectable = [it for it in items if isinstance(it, _ListSession)]
             sel_total = len(selectable)
             sel_pos = 0
@@ -1389,9 +1686,19 @@ class ClawMonitorTUI:
                     sel_pos = 1 + [x.sv.meta.key for x in selectable].index(sv.meta.key)
                 except ValueError:
                     sel_pos = 0
+            refresh_note = ""
+            if in_prog:
+                if prog_total > 0:
+                    refresh_note = f" refreshing={prog_step}/{prog_total}"
+                else:
+                    refresh_note = " refreshing"
+                if prog_msg:
+                    refresh_note += f"({prog_msg})"
+            elif err:
+                refresh_note = f" refreshErr={err[:40]}"
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}"
+                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 
