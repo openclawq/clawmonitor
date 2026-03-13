@@ -96,8 +96,12 @@ def collect_status(
     for meta in metas:
         if hide_system_sessions and meta.system_sent:
             continue
-        tail = tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None, None)
-        user_msg = tail.last_user_send or tail.last_user
+        tail = (
+            tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes)
+            if meta.session_file
+            else TranscriptTail(None, None, None, None, None, None, None)
+        )
+        user_msg = tail.last_user_send
         user_preview = redact_text(user_msg.preview) if user_msg else "-"
         assistant_preview = redact_text(tail.last_assistant.preview) if tail.last_assistant else "-"
         lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
@@ -149,7 +153,8 @@ def collect_status(
         if lock:
             # Best-effort "what is it working on right now?"
             # Prefer strict inbound user text; fall back to last user role message.
-            task_preview = redact_text((tail.last_user_send or tail.last_user).preview) if (tail.last_user_send or tail.last_user) else "-"
+            src = tail.last_user_send
+            task_preview = redact_text(src.preview) if src else "-"
 
         rows.append(
             StatusRow(

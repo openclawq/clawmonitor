@@ -76,6 +76,14 @@ def _extract_inbound_from_internal_wrapper(text: str) -> Optional[str]:
     if not s:
         return None
 
+    # Be conservative: only attempt wrapper extraction when there are strong
+    # signals that this "user" message is a channel wrapper containing real
+    # inbound user content (e.g., Telegram wrapper with untrusted metadata).
+    lower = s.lower()
+    has_meta_hint = bool(_META_BLOCK_RE.search(s)) or ("untrusted metadata" in lower)
+    if not has_meta_hint:
+        return None
+
     sender_id: Optional[str] = None
     m = _META_BLOCK_RE.search(s)
     if m:
@@ -100,7 +108,7 @@ def _extract_inbound_from_internal_wrapper(text: str) -> Optional[str]:
         msg = (mm.group(2) or "").strip()
         if not msg:
             continue
-        if sender.lower() in ("message_id", "sender_id", "sender", "timestamp"):
+        if sender.lower() in ("message_id", "sender_id", "sender", "timestamp", "current time", "system"):
             continue
         # If we have a sender_id, prefer matching it, otherwise accept any.
         if sender_id and sender != sender_id:
@@ -160,13 +168,30 @@ class TranscriptTail:
     # last_trigger: newest internal/control-plane trigger (if present).
     last_trigger: Optional[TailMessage]
     last_assistant: Optional[TailMessage]
+    last_assistant_thinking: Optional[str]
     last_tool_error: Optional[Tuple[Optional[datetime], str]]
     last_compaction_at: Optional[datetime]
 
 
+def _extract_thinking(content: Any, max_chars: int = 400) -> str:
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "thinking":
+            continue
+        thinking = item.get("thinking")
+        if isinstance(thinking, str) and thinking.strip():
+            parts.append(thinking.strip())
+    joined = " ".join(parts).strip()
+    return joined[:max_chars] if joined else ""
+
+
 def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     if not path.exists():
-        return TranscriptTail(None, None, None, None, None, None)
+        return TranscriptTail(None, None, None, None, None, None, None)
     # Read backwards in growing chunks until we find both last user and last assistant
     # (or we hit an upper bound).
     max_total = max(256 * 1024, min(2 * 1024 * 1024, max_bytes * 16))
@@ -174,7 +199,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     try:
         size = path.stat().st_size
     except Exception:
-        return TranscriptTail(None, None, None, None, None, None)
+        return TranscriptTail(None, None, None, None, None, None, None)
 
     gathered_text = ""
     read_total = 0
@@ -203,6 +228,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     last_user_send: Optional[TailMessage] = None
     last_trigger: Optional[TailMessage] = None
     last_assistant: Optional[TailMessage] = None
+    last_assistant_thinking: Optional[str] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
     last_compaction_at: Optional[datetime] = None
 
@@ -256,16 +282,19 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
 
         if role == "assistant" and last_assistant is None:
             stop_reason = msg.get("stopReason")
+            thinking = _extract_thinking(msg.get("content"), max_chars=400)
             last_assistant = TailMessage(
                 role="assistant",
                 ts=ts,
                 preview=_extract_text(msg.get("content")),
                 stop_reason=str(stop_reason) if stop_reason is not None else None,
             )
+            last_assistant_thinking = thinking or None
             continue
 
         # Stop early once we have enough for monitoring UI.
-        if last_user and last_assistant and (last_user_send or last_trigger):
+        # We prefer waiting until we have a *real* inbound user message.
+        if last_user and last_assistant and last_user_send:
             break
 
     return TranscriptTail(
@@ -273,6 +302,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         last_user_send=last_user_send,
         last_trigger=last_trigger,
         last_assistant=last_assistant,
+        last_assistant_thinking=last_assistant_thinking,
         last_tool_error=last_tool_error,
         last_compaction_at=last_compaction_at,
     )

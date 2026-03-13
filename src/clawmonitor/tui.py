@@ -379,7 +379,7 @@ class MonitorModel:
 
     def _tail_for(self, session_file: Optional[Path]) -> TranscriptTail:
         if not session_file:
-            return TranscriptTail(None, None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None, None)
         try:
             st = session_file.stat()
             key = session_file
@@ -390,7 +390,7 @@ class MonitorModel:
             self._tail_cache[key] = (st.st_mtime, st.st_size, tail)
             return tail
         except Exception:
-            return TranscriptTail(None, None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None, None)
 
     def _refresh_telegram_bindings(self) -> None:
         # Lightweight local file read; throttle to avoid needless IO.
@@ -573,7 +573,7 @@ class ClawMonitorTUI:
                 self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
                 continue
             sv = sessions[idx]
-            user_msg = sv.tail.last_user_send or sv.tail.last_user
+            user_msg = sv.tail.last_user_send
             u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
@@ -617,9 +617,13 @@ class ClawMonitorTUI:
         if not sv:
             return
         rel_logs: List[str] = []
+        last_activity: Optional[str] = None
         if self.show_logs:
             rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
             rel_logs = [ln.text for ln in rel][-20:]
+            if rel:
+                ln = rel[-1]
+                last_activity = (ln.text or ln.raw or "").strip()
 
         log_budget = 0
         if self.show_logs:
@@ -631,9 +635,9 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
 
         if w >= 110 and detail_h >= 14:
-            self._draw_details_status_split3(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+            self._draw_details_status_split3(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv, last_activity=last_activity)
         elif w >= 24 and detail_h >= 14:
-            self._draw_details_status_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+            self._draw_details_status_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv, last_activity=last_activity)
         else:
             self._draw_details_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
 
@@ -702,7 +706,17 @@ class ClawMonitorTUI:
         for i in range(min(h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
 
-    def _draw_details_status_split3(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+    def _draw_details_status_split3(
+        self,
+        stdscr: "curses._CursesWindow",
+        x: int,
+        y: int,
+        h: int,
+        w: int,
+        sv: SessionView,
+        *,
+        last_activity: Optional[str],
+    ) -> None:
         # Top status block spans width; bottom has 3 columns:
         # Last User Send | Last Claw Send | Last Trigger
         status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
@@ -732,6 +746,21 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        # Task summary (best-effort): show what the agent is working on right now.
+        if sv.lock:
+            task_src = sv.tail.last_user_send
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
+            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
+                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
+                status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
         acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
         if acct_info:
             in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
@@ -811,7 +840,17 @@ class ClawMonitorTUI:
         for i in range(min(body_h, len(trig_lines))):
             self._safe_addnstr(stdscr, y_msgs + 1 + i, x3, _fit(trig_lines[i], col3), col3)
 
-    def _draw_details_status_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+    def _draw_details_status_stacked(
+        self,
+        stdscr: "curses._CursesWindow",
+        x: int,
+        y: int,
+        h: int,
+        w: int,
+        sv: SessionView,
+        *,
+        last_activity: Optional[str],
+    ) -> None:
         # Stacked panes: Status / Last User Send / Last Claw Send / Last Trigger
         status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
         user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
@@ -851,6 +890,21 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.lock:
+            task_src = sv.tail.last_user_send
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
+            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
+                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                status_lines.extend(
+                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
+                )
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
         acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
         if acct_info:
             in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)

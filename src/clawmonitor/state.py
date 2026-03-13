@@ -42,7 +42,9 @@ def compute_state(
     long_run_warn_seconds: int = 15 * 60,
     long_run_crit_seconds: int = 60 * 60,
 ) -> SessionComputed:
-    user_msg = tail.last_user_send or tail.last_user
+    # Strict: only treat "Last User Send" as real inbound user text. Internal
+    # control-plane injections are tracked separately as last_trigger.
+    user_msg = tail.last_user_send
     last_user_ts = user_msg.ts if user_msg else None
     last_assistant_ts = tail.last_assistant.ts if tail.last_assistant else None
 
