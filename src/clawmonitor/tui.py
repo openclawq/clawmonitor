@@ -9,6 +9,48 @@ import time
 import re
 import threading
 import unicodedata
+import os
+
+def _load_loading_art_lines() -> List[str]:
+    """
+    Load the TUI loading splash art.
+
+    Precedence:
+      1) $CLAWMONITOR_LOADING_ART (if set)
+      2) docs/loadingart.txt in a source checkout (editable installs)
+      3) packaged resource clawmonitor.assets/loadingart.txt
+      4) small built-in fallback
+    """
+    env_path = os.environ.get("CLAWMONITOR_LOADING_ART", "").strip()
+    if env_path:
+        try:
+            p = Path(env_path).expanduser()
+            if p.exists():
+                return p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            pass
+
+    # Try to locate docs/loadingart.txt in a source tree (best-effort).
+    try:
+        here = Path(__file__).resolve()
+        for parent in list(here.parents)[:6]:
+            cand = parent / "docs" / "loadingart.txt"
+            if cand.exists():
+                return cand.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        pass
+
+    try:
+        import importlib.resources as resources
+
+        art = resources.files("clawmonitor.assets").joinpath("loadingart.txt").read_text(encoding="utf-8")
+        return art.splitlines()
+    except Exception:
+        return [
+            "ClawMonitor",
+            "",
+            "loading…",
+        ]
 
 from .actions import TEMPLATES, send_nudge
 from .acpx_sessions import AcpxSnapshot, acpx_is_working, acpx_session_path, load_acpx_snapshot, tail_acpx_messages
@@ -571,6 +613,7 @@ class ClawMonitorTUI:
         self.cfg = cfg
         self.elog = EventLog()
         self.model = MonitorModel(cfg, self.elog)
+        self._loading_art_lines = _load_loading_art_lines()
         self.selected = 0
         self.scroll = 0
         self.selected_session_key: Optional[str] = None
@@ -834,18 +877,26 @@ class ClawMonitorTUI:
         h, w = stdscr.getmaxyx()
         stdscr.erase()
 
-        art = [
-            "   ___ _                __  __            _ _           ",
-            "  / __| |__ ___ __ __  |  \\/  |___ _ _  __| (_)__ _ _ _ ",
-            " | (__| / _` \\ V  V /  | |\\/| / _ \\ ' \\/ _` | / _` | '_|",
-            "  \\___|_\\__,_|\\_/\\_/   |_|  |_\\___/_||_\\__,_|_\\__,_|_|  ",
-            "",
-            "             (shrimp mode)  <\\(((())))>/",
-            "",
-        ]
-        y0 = max(0, (h // 2) - (len(art) // 2) - 2)
+        art = list(self._loading_art_lines or [])
+        # Keep enough vertical space for progress + footer notes.
+        max_art_h = max(0, h - 8)
+        if max_art_h and len(art) > max_art_h:
+            # Prefer keeping the "shrimp" block visible on small terminals.
+            shrimp_start = None
+            for i, ln in enumerate(art):
+                if any(ch in ln for ch in ("⣀", "⣿", "⠀⠀")):
+                    shrimp_start = i
+                    break
+            if shrimp_start is not None:
+                art = art[shrimp_start : shrimp_start + max_art_h]
+            else:
+                art = art[:max_art_h]
+        block_h = len(art) + 6
+        y0 = max(0, (h - block_h) // 2)
         for i, ln in enumerate(art):
-            x0 = max(0, (w - len(ln)) // 2)
+            ln = ln.rstrip("\n")
+            ln_w = _display_width(ln)
+            x0 = 0 if ln_w >= w - 2 else max(0, (w - ln_w) // 2)
             self._safe_addnstr(stdscr, y0 + i, x0, ln, max(0, w - 2))
 
         step = max(0, min(total_steps, step))
