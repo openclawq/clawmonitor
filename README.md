@@ -2,6 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
+![ClawMonitor TUI](docs/clawmonitor.png)
+
+![ClawMonitor loading screen](docs/clawmonitor_loading.png)
+
 Real-time **OpenClaw** session monitor with:
 
 - Per-session last inbound **user** message + last outbound **assistant** message (preview + timestamp)

@@ -2,6 +2,10 @@
 
 [English](README.md) | 简体中文
 
+![ClawMonitor TUI](docs/clawmonitor.png)
+
+![ClawMonitor loading screen](docs/clawmonitor_loading.png)
+
 用于 **OpenClaw** 的实时 Session/Thread 监控工具，核心能力：
 
 - 每个 Session 的最后一条 **user** / **assistant** 消息（预览 + 时间）
