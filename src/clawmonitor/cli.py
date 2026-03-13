@@ -36,7 +36,10 @@ def _config_with_overrides(cfg_path: Optional[str], openclaw_root: Optional[str]
 
 def cmd_tui(args: argparse.Namespace) -> int:
     cfg = _config_with_overrides(args.config, args.openclaw_root)
-    ClawMonitorTUI(cfg).run()
+    from .config import default_config_path
+
+    cfg_path = Path(args.config).expanduser() if args.config else default_config_path()
+    ClawMonitorTUI(cfg, config_path=cfg_path).run()
     return 0
 
 

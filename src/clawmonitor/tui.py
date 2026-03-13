@@ -60,6 +60,7 @@ from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .diagnostics import Finding, diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
+from .config import write_labels
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
 from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
@@ -660,8 +661,9 @@ ListItem = Union[_ListHeader, _ListSession, _ListCronJob]
 
 
 class ClawMonitorTUI:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, config_path: Optional[Path] = None) -> None:
         self.cfg = cfg
+        self.config_path = config_path
         self.elog = EventLog()
         self.model = MonitorModel(cfg, self.elog)
         self._loading_art_lines = _load_loading_art_lines()
@@ -670,7 +672,7 @@ class ClawMonitorTUI:
         self.selected_session_key: Optional[str] = None
         self.show_logs = True
         self.tree_view = True
-        self.show_cron = False
+        self.show_cron = True
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -1585,6 +1587,122 @@ class ClawMonitorTUI:
             elif ch in (10, 13):
                 return items[idx]
 
+    def _pick_label_key(self, stdscr: "curses._CursesWindow", meta: SessionMeta) -> Optional[str]:
+        key = (meta.key or "").strip()
+        chan = (meta.channel or "").strip()
+        opts: List[Tuple[str, str]] = []
+        if chan and key:
+            tail = key.split(":")[-1].strip()
+            if tail:
+                opts.append((f"id:{chan}:{tail}", f"id:{chan}:{tail}"))
+        if chan and meta.to:
+            opts.append((f"target:{chan}:{meta.to}", f"target:{chan}:{meta.to}"))
+        if key:
+            opts.append((f"sessionKey:{key}", f"sessionKey:{key}"))
+        if not opts:
+            return None
+
+        idx = 0
+        scroll = 0
+        h, w = stdscr.getmaxyx()
+        win_h = min(10, h - 4)
+        win_w = min(96, max(50, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        while True:
+            win.clear()
+            win.border()
+            self._safe_addnstr(win, 0, 2, " Choose label key ", win_w - 4)
+            visible = max(1, win_h - 2)
+            if idx < scroll:
+                scroll = idx
+            if idx >= scroll + visible:
+                scroll = idx - visible + 1
+            view = opts[scroll : scroll + visible]
+            for i, (label, _) in enumerate(view):
+                real_idx = scroll + i
+                attr = curses.A_REVERSE if real_idx == idx else curses.A_NORMAL
+                self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(label, win_w - 4), win_w - 4, attr)
+            win.refresh()
+            ch = win.getch()
+            if ch in (27, ord("q")):
+                return None
+            if ch in (curses.KEY_UP, ord("k")):
+                idx = max(0, idx - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                idx = min(len(opts) - 1, idx + 1)
+            elif ch in (10, 13):
+                return opts[idx][1]
+
+    def _prompt_label(self, stdscr: "curses._CursesWindow", *, title: str, current: str) -> Optional[str]:
+        h, w = stdscr.getmaxyx()
+        win_h = 9
+        win_w = min(96, max(50, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        win.clear()
+        win.border()
+        self._safe_addnstr(win, 0, 2, f" {title} ", win_w - 4)
+        self._safe_addnstr(win, 1, 2, "Current:", win_w - 4)
+        self._safe_addnstr(win, 2, 4, _fit(current or "-", win_w - 6), win_w - 6)
+        self._safe_addnstr(win, 4, 2, "New label (empty = clear, Esc = cancel):", win_w - 4)
+        win.refresh()
+
+        # Input line
+        try:
+            curses.curs_set(1)
+        except Exception:
+            pass
+        win.move(5, 2)
+        win.clrtoeol()
+        win.refresh()
+        curses.echo()
+        try:
+            raw = win.getstr(5, 2, max(1, win_w - 4))
+        except KeyboardInterrupt:
+            raw = None
+        except Exception:
+            raw = None
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+        if raw is None:
+            return None
+        try:
+            s = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            s = str(raw)
+        return s.strip()
+
+    def _rename_selected(self, stdscr: "curses._CursesWindow", sv: SessionView) -> None:
+        meta = sv.meta
+        key = self._pick_label_key(stdscr, meta)
+        if not key:
+            return
+        current = self.cfg.labels.get(key) or ""
+        new_label = self._prompt_label(stdscr, title="Set session label", current=current)
+        if new_label is None:
+            return
+        if not new_label:
+            if key in self.cfg.labels:
+                self.cfg.labels.pop(key, None)
+                self.elog.write("labels.cleared", key=key)
+        else:
+            self.cfg.labels[key] = new_label
+            self.elog.write("labels.set", key=key, label=new_label)
+        if self.config_path:
+            try:
+                write_labels(self.config_path, self.cfg.labels)
+            except Exception as e:
+                self.elog.write("labels.write_failed", key=key, error=str(e))
+
     def _help_overlay(self, stdscr: "curses._CursesWindow") -> None:
         lines = [
             "ClawMonitor TUI Help",
@@ -1595,6 +1713,7 @@ class ClawMonitorTUI:
             "",
             "Actions:",
             "  r              Refresh now",
+            "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
@@ -1770,6 +1889,11 @@ class ClawMonitorTUI:
                 self.show_cron = not self.show_cron
                 self.scroll = 0
                 dirty = True
+            elif ch == ord("R"):
+                sv = self._selected_session(items)
+                if sv:
+                    self._rename_selected(stdscr, sv)
+                dirty = True
             elif ch == ord("?"):
                 self._help_overlay(stdscr)
                 dirty = True
@@ -1854,7 +1978,7 @@ class ClawMonitorTUI:
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
                 f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
-                f"[Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
+                f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

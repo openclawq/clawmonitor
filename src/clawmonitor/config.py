@@ -101,3 +101,59 @@ def load_config(path: Optional[Path] = None) -> Config:
         hide_system_sessions=hide_system_sessions,
         labels=label_map,
     )
+
+
+def _toml_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace("\"", "\\\"")
+
+
+def write_labels(config_path: Path, labels: Dict[str, str]) -> None:
+    """
+    Update (or append) a `[labels]` section in config.toml.
+
+    This keeps edits localized so user config stays readable and shareable.
+    """
+    config_path = config_path.expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except Exception:
+        text = ""
+    lines = text.splitlines()
+
+    section_lines = ["[labels]"]
+    for k in sorted(labels.keys()):
+        v = labels[k]
+        if not k or not v:
+            continue
+        section_lines.append(f"\"{_toml_escape(k)}\" = \"{_toml_escape(v)}\"")
+
+    def is_header(ln: str) -> bool:
+        s = ln.strip()
+        return s.startswith("[") and s.endswith("]") and len(s) >= 3
+
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == "[labels]":
+            start = i
+            break
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("")
+        lines.extend(section_lines)
+    else:
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if is_header(lines[j]):
+                end = j
+                break
+        # Replace the whole section block.
+        # Preserve a blank line before the next section if present.
+        suffix = lines[end:]
+        if suffix and suffix[0].strip():
+            section_lines = section_lines + [""]
+        lines = lines[:start] + section_lines + suffix
+
+    out = "\n".join(lines).rstrip() + "\n"
+    config_path.write_text(out, encoding="utf-8")
