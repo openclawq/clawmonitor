@@ -22,6 +22,7 @@ from .session_tail import tail_for_meta
 from .acpx_sessions import acpx_is_working
 from .state import WorkingSignal, compute_state
 from .status_cli import collect_status, format_json as format_status_json, format_markdown as format_status_markdown, format_table, watch_loop
+from .cron_cli import collect_cron as collect_cron_jobs, format_json as format_cron_json, format_markdown as format_cron_markdown, format_table as format_cron_table
 from .tui import ClawMonitorTUI
 from .tree_cli import format_tree
 
@@ -144,6 +145,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(format_status_markdown(rows, limit=args.limit, detail=bool(args.detail)))
     else:
         print(format_table(rows, limit=args.limit, detail=bool(args.detail)))
+    return 0
+
+
+def cmd_cron(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    rows = collect_cron_jobs(cfg.openclaw_root)
+    if args.format == "json":
+        print(format_cron_json(rows, cfg.openclaw_root))
+    elif args.format == "md":
+        print(format_cron_markdown(rows))
+    else:
+        print(format_cron_table(rows))
     return 0
 
 
@@ -355,6 +368,10 @@ def main() -> None:
     status.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     status.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     status.set_defaults(func=cmd_status)
+
+    cron = sub.add_parser("cron", help="List configured cron jobs and last run status")
+    cron.add_argument("--format", choices=["text", "json", "md"], default="text")
+    cron.set_defaults(func=cmd_cron)
 
     tree = sub.add_parser("tree", help="Print a tree-ish view grouped by agent")
     tree.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")

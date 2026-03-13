@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,13 @@ class CronJob:
 class CronSnapshot:
     jobs_by_id: Dict[str, CronJob]
     jobs_by_prefix: Dict[str, CronJob]
+
+
+@dataclass(frozen=True)
+class CronRunStatus:
+    job_id: str
+    ts_ms: Optional[int]
+    status: Optional[str]
 
 
 def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -81,6 +88,62 @@ def read_cron_snapshot(openclaw_root: Path) -> CronSnapshot:
     return CronSnapshot(jobs_by_id=by_id, jobs_by_prefix=by_prefix)
 
 
+def _tail_last_jsonl_obj(path: Path, *, max_bytes: int = 8192) -> Optional[Dict[str, Any]]:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return None
+    if not data:
+        return None
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+        # Drop partial first line if we cut mid-line.
+        nl = data.find(b"\n")
+        if nl != -1:
+            data = data[nl + 1 :]
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    for line in reversed([ln.strip() for ln in text.splitlines()]):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def read_cron_last_runs(openclaw_root: Path) -> Dict[str, CronRunStatus]:
+    """
+    Read last run status for each job from ~/.openclaw/cron/runs/<jobId>.jsonl
+    (best-effort).
+    """
+    runs_dir = openclaw_root / "cron" / "runs"
+    out: Dict[str, CronRunStatus] = {}
+    if not runs_dir.exists():
+        return out
+    for path in sorted(runs_dir.glob("*.jsonl")):
+        job_id = path.stem
+        obj = _tail_last_jsonl_obj(path)
+        ts = obj.get("ts") if isinstance(obj, dict) else None
+        status = obj.get("status") if isinstance(obj, dict) else None
+        ts_ms: Optional[int] = None
+        if isinstance(ts, int):
+            ts_ms = ts
+        elif isinstance(ts, float):
+            ts_ms = int(ts)
+        out[job_id] = CronRunStatus(
+            job_id=job_id,
+            ts_ms=ts_ms,
+            status=str(status) if isinstance(status, str) and status else None,
+        )
+    return out
+
+
 def cron_job_id_from_session_key(session_key: str) -> Optional[str]:
     key = (session_key or "").strip()
     if not key:
@@ -108,4 +171,3 @@ def match_cron_job(snap: Optional[CronSnapshot], session_key: str) -> Optional[C
         return None
     # Exact id first, then prefix.
     return snap.jobs_by_id.get(jid) or snap.jobs_by_prefix.get(jid)
-
