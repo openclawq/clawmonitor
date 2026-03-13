@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5
+
+- TUI: startup loading splash (customizable via `docs/loadingart.txt` or `$CLAWMONITOR_LOADING_ART`).
+- TUI: async refresh + cached related logs to reduce UI stalls when Gateway is slow.
+- ACP: enrich ACP sessions via `~/.acpx/sessions/<acpxSessionId>.json` when available; better WORKING detection for ACP runs.
+- Transcript tail: improved wrapper extraction and preview cleanup (gateway time prefixes, `[[...]]` markers).
+
 ## 0.1.4
 
 - TUI: tree view in the left list (group sessions by agent; highlight ACP/subagent via indentation).
