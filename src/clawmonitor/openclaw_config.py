@@ -53,6 +53,21 @@ def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
 _IDENTITY_NAME_RE = re.compile(r"(?i)\bname\b\s*:\s*(.+)$")
 
 
+def _clean_identity_name(name: str) -> str:
+    """
+    Keep identity names user-friendly.
+
+    Some users keep explanatory text in parentheses (e.g. "大虾（这是我的名字）").
+    For display, drop common "this is my name" suffixes while keeping the core
+    name.
+    """
+    s = (name or "").strip()
+    if not s:
+        return s
+    s = re.sub(r"\s*[（(][^）)]*(这是我的名字|this is my name)[^）)]*[)）]\s*$", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def _read_identity_name(workspace_dir: Path) -> Optional[str]:
     path = workspace_dir / "IDENTITY.md"
     try:
@@ -71,6 +86,7 @@ def _read_identity_name(workspace_dir: Path) -> Optional[str]:
         val = (m.group(1) or "").strip()
         # Strip trailing Markdown emphasis artifacts / punctuation.
         val = val.strip().strip("_").strip()
+        val = _clean_identity_name(val)
         if val:
             return val
     return None

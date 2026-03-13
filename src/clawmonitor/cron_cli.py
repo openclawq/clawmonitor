@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .openclaw_config import read_openclaw_config_snapshot
 from .openclaw_cron import CronJob, read_cron_last_runs, read_cron_snapshot
 
 
@@ -50,6 +51,7 @@ class CronRow:
     job_id: str
     name: str
     agent_id: str
+    agent_label: str
     enabled: str
     schedule: str
     last_run_at: str
@@ -69,16 +71,19 @@ def _job_schedule(job: CronJob) -> str:
 def collect_cron(openclaw_root: Path) -> List[CronRow]:
     snap = read_cron_snapshot(openclaw_root)
     runs = read_cron_last_runs(openclaw_root)
+    cfg = read_openclaw_config_snapshot(openclaw_root)
 
     rows: List[CronRow] = []
     for job_id, job in sorted(snap.jobs_by_id.items(), key=lambda kv: (kv[1].agent_id or "", kv[1].name or "", kv[0])):
         run = runs.get(job_id)
         dt = _dt_from_ms(run.ts_ms) if run else None
+        agent_id = job.agent_id or "main"
         rows.append(
             CronRow(
                 job_id=job_id,
                 name=job.name or "-",
-                agent_id=job.agent_id or "main",
+                agent_id=agent_id,
+                agent_label=cfg.agent_label(agent_id),
                 enabled="-" if job.enabled is None else ("Y" if job.enabled else "N"),
                 schedule=_job_schedule(job),
                 last_run_at=_fmt_dt(dt),
@@ -99,19 +104,19 @@ def format_table(rows: List[CronRow]) -> str:
         return (s[: width - 1] + "…")[:width]
 
     job_w = max(8, min(12, max((len(r.job_id) for r in rows), default=8)))
-    agent_w = max(8, min(20, max((len(r.agent_id) for r in rows), default=8)))
+    agent_w = max(8, min(24, max((len(r.agent_label) for r in rows), default=8)))
     header = f"{fit('JOB', job_w)}  {fit('AGENT', agent_w)}  EN  {fit('SCHEDULE', 22)}  LAST     STAT  NAME"
     lines = [header]
     for r in rows:
         lines.append(
-            f"{fit(r.job_id, job_w)}  {fit(r.agent_id, agent_w)}  {fit(r.enabled, 2)}  "
+            f"{fit(r.job_id, job_w)}  {fit(r.agent_label, agent_w)}  {fit(r.enabled, 2)}  "
             f"{fit(r.schedule, 22)}  {fit(r.last_run_age, 4)}  {fit(r.last_status, 4)}  {r.name}"
         )
     return "\n".join(lines) + "\n"
 
 
 def format_markdown(rows: List[CronRow]) -> str:
-    header = ["jobId", "agentId", "enabled", "schedule", "lastRunAt", "lastRunAge", "lastStatus", "name"]
+    header = ["jobId", "agent", "enabled", "schedule", "lastRunAt", "lastRunAge", "lastStatus", "name"]
     lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
     def esc(v: str) -> str:
         return (v or "-").replace("|", "\\|").replace("\n", " ")
@@ -122,7 +127,7 @@ def format_markdown(rows: List[CronRow]) -> str:
             + " | ".join(
                 [
                     esc(r.job_id),
-                    esc(r.agent_id),
+                    esc(r.agent_label),
                     esc(r.enabled),
                     esc(r.schedule),
                     esc(r.last_run_at),
@@ -145,6 +150,7 @@ def format_json(rows: List[CronRow], openclaw_root: Path) -> str:
             {
                 "jobId": r.job_id,
                 "agentId": r.agent_id,
+                "agentLabel": r.agent_label,
                 "enabled": r.enabled,
                 "schedule": r.schedule,
                 "lastRunAt": r.last_run_at,

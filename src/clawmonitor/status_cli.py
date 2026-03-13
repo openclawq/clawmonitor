@@ -94,6 +94,7 @@ def collect_status(
     transcript_tail_bytes: int,
     hide_system_sessions: bool,
     include_gateway_channels: bool = True,
+    label_map: Optional[Dict[str, str]] = None,
 ) -> List[StatusRow]:
     metas = list_sessions(openclaw_root)
     delivery_map = load_failed_delivery_map(openclaw_root)
@@ -180,6 +181,15 @@ def collect_status(
         agent_label = cfg_snapshot.agent_label(meta.agent_id)
         cron_job = match_cron_job(cron_snapshot, meta.key)
         session_label = meta.key
+        if label_map:
+            try:
+                from .labels import session_display_label
+
+                lbl = session_display_label(label_map, meta)
+                if lbl:
+                    session_label = lbl
+            except Exception:
+                pass
         if cron_job:
             base = cron_job.name or cron_job.id
             if key_info.kind == "cron_run":
@@ -331,6 +341,7 @@ def watch_loop(
     hide_system_sessions: bool,
     interval_seconds: float,
     limit: Optional[int],
+    label_map: Optional[Dict[str, str]] = None,
 ) -> None:
     try:
         import os
@@ -342,6 +353,7 @@ def watch_loop(
                 transcript_tail_bytes=transcript_tail_bytes,
                 hide_system_sessions=hide_system_sessions,
                 include_gateway_channels=True,
+                label_map=label_map,
             )
             os.system("clear")
             print(format_table(rows, limit=limit))

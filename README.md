@@ -56,6 +56,11 @@ Default config path:
 
 Example config is in `config.example.toml`.
 
+### Optional labels
+
+You can assign human-friendly names to long session keys (e.g. Feishu `ou_...`).
+See the `[labels]` section in `config.example.toml`.
+
 Runtime data (NOT stored in this repo):
 
 - Logs: `~/.local/state/clawmonitor/events.jsonl`

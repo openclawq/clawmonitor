@@ -41,6 +41,7 @@ class Config:
     gateway_log_ring_lines: int
     report_max_log_lines: int
     hide_system_sessions: bool
+    labels: Dict[str, str]
 
 
 def _load_toml(path: Path) -> Dict[str, Any]:
@@ -66,6 +67,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     refresh = doc.get("refresh", {}) if isinstance(doc, dict) else {}
     limits = doc.get("limits", {}) if isinstance(doc, dict) else {}
     ui = doc.get("ui", {}) if isinstance(doc, dict) else {}
+    labels = doc.get("labels", {}) if isinstance(doc, dict) else {}
 
     openclaw_root = Path(_expanduser(str(openclaw.get("root", "~/.openclaw"))))
     openclaw_bin = str(openclaw.get("openclaw_bin", "openclaw"))
@@ -80,6 +82,11 @@ def load_config(path: Optional[Path] = None) -> Config:
     report_max_log_lines = int(limits.get("report_max_log_lines", 200))
 
     hide_system_sessions = bool(ui.get("hide_system_sessions", False))
+    label_map: Dict[str, str] = {}
+    if isinstance(labels, dict):
+        for k, v in labels.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                label_map[k.strip()] = v.strip()
 
     return Config(
         openclaw_root=openclaw_root,
@@ -92,4 +99,5 @@ def load_config(path: Optional[Path] = None) -> Config:
         gateway_log_ring_lines=gateway_log_ring_lines,
         report_max_log_lines=report_max_log_lines,
         hide_system_sessions=hide_system_sessions,
+        labels=label_map,
     )

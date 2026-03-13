@@ -17,3 +17,15 @@ report_max_log_lines = 200
 
 [ui]
 hide_system_sessions = false
+
+# Optional human-friendly labels for sessions/targets.
+#
+# Supported key shapes:
+# - sessionKey:<full session key> = "My Label"
+# - target:<channel>:<to>        = "My Label"   (uses sessions.json deliveryContext.to / lastTo)
+# - id:<channel>:<id>            = "My Label"   (uses sessionKey tail, e.g. Feishu ou_/oc_ ids)
+#
+# Examples:
+# [labels]
+# "id:feishu:ou_4a2c2c233c31cda49573d6848482920e" = "Math Q&A"
+# "id:telegram:8561029144" = "My Telegram DM"

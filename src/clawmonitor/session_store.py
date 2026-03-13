@@ -20,6 +20,7 @@ class SessionMeta:
     channel: Optional[str]
     account_id: Optional[str]
     to: Optional[str]
+    origin_label: Optional[str]
     parent_session_key: Optional[str]
     acp_state: Optional[str]
     acpx_session_id: Optional[str]
@@ -79,6 +80,8 @@ def list_sessions(openclaw_root: Path) -> List[SessionMeta]:
             channel = delivery_context.get("channel") or entry.get("lastChannel") or (entry.get("origin", {}) or {}).get("surface")
             account_id = delivery_context.get("accountId") or entry.get("lastAccountId") or (entry.get("origin", {}) or {}).get("accountId")
             to = delivery_context.get("to") or entry.get("lastTo")
+            origin = entry.get("origin") if isinstance(entry.get("origin"), dict) else {}
+            origin_label = origin.get("label")
             parent_session_key = entry.get("parentSessionKey")
 
             acp_state: Optional[str] = None
@@ -112,6 +115,7 @@ def list_sessions(openclaw_root: Path) -> List[SessionMeta]:
                     channel=str(channel) if channel is not None else None,
                     account_id=str(account_id) if account_id is not None else None,
                     to=str(to) if to is not None else None,
+                    origin_label=str(origin_label) if isinstance(origin_label, str) and origin_label else None,
                     parent_session_key=str(parent_session_key) if isinstance(parent_session_key, str) and parent_session_key else None,
                     acp_state=acp_state,
                     acpx_session_id=acpx_session_id,

@@ -138,6 +138,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         transcript_tail_bytes=cfg.transcript_tail_bytes,
         hide_system_sessions=args.hide_system if args.hide_system is not None else cfg.hide_system_sessions,
         include_gateway_channels=not args.no_gateway,
+        label_map=cfg.labels,
     )
     if args.format == "json":
         print(format_status_json(rows, cfg.openclaw_root))
@@ -268,6 +269,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         hide_system_sessions=args.hide_system if args.hide_system is not None else cfg.hide_system_sessions,
         interval_seconds=float(args.interval),
         limit=args.limit,
+        label_map=cfg.labels,
     )
     return 0
 

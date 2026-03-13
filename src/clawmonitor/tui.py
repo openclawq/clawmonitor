@@ -62,7 +62,8 @@ from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
-from .openclaw_cron import CronSnapshot, match_cron_job, read_cron_snapshot
+from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
+from .labels import session_display_label
 from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
@@ -390,6 +391,8 @@ class MonitorModel:
         self._cfg_snapshot_last_load = 0.0
         self._cron_snapshot: Optional[CronSnapshot] = None
         self._cron_snapshot_last_load = 0.0
+        self._cron_last_runs: Dict[str, CronRunStatus] = {}
+        self._cron_last_runs_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -409,6 +412,11 @@ class MonitorModel:
     def cron_snapshot(self) -> Optional[CronSnapshot]:
         with self._sessions_lock:
             return self._cron_snapshot
+
+    @property
+    def cron_last_runs(self) -> Dict[str, CronRunStatus]:
+        with self._sessions_lock:
+            return dict(self._cron_last_runs)
 
     @property
     def sessions(self) -> List[SessionView]:
@@ -504,6 +512,18 @@ class MonitorModel:
             self._cron_snapshot = snap
             self._cron_snapshot_last_load = now
 
+    def _refresh_cron_last_runs(self) -> None:
+        now = time.time()
+        if now - self._cron_last_runs_last_load < 2.0:
+            return
+        try:
+            runs = read_cron_last_runs(self.cfg.openclaw_root)
+        except Exception:
+            runs = {}
+        with self._sessions_lock:
+            self._cron_last_runs = runs
+            self._cron_last_runs_last_load = now
+
     def _tail_for_meta(self, meta: SessionMeta, *, lock_present: bool) -> TranscriptTail:
         """
         Avoid re-statting/re-reading JSONL on every refresh by using sessions.json
@@ -552,6 +572,7 @@ class MonitorModel:
         self._refresh_config_snapshot()
         tick("Reading cron jobs…", 6, 8)
         self._refresh_cron_snapshot()
+        self._refresh_cron_last_runs()
 
         tick("Listing sessions…", 7, 8)
         metas = list_sessions(self.cfg.openclaw_root)
@@ -617,6 +638,7 @@ class _ListHeader:
     agent_id: str
     agent_kind: str  # configured|implicit
     count: int
+    cron_count: int
 
 
 @dataclass(frozen=True)
@@ -627,7 +649,14 @@ class _ListSession:
     key_tail: str
 
 
-ListItem = Union[_ListHeader, _ListSession]
+@dataclass(frozen=True)
+class _ListCronJob:
+    agent_id: str
+    job: CronJob
+    last_run: Optional[CronRunStatus]
+
+
+ListItem = Union[_ListHeader, _ListSession, _ListCronJob]
 
 
 class ClawMonitorTUI:
@@ -641,6 +670,7 @@ class ClawMonitorTUI:
         self.selected_session_key: Optional[str] = None
         self.show_logs = True
         self.tree_view = True
+        self.show_cron = False
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -776,6 +806,11 @@ class ClawMonitorTUI:
             parts = key.split(":")
             if len(parts) >= 6 and parts[0] == "agent" and parts[2] == "cron" and parts[4] == "run":
                 return f"run:{parts[5]}"
+        # For channel sessions, prefer a human label if configured.
+        if info.kind == "channel":
+            lbl = session_display_label(self.cfg.labels, sv.meta)
+            if lbl:
+                return lbl
         return self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
 
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
@@ -796,6 +831,13 @@ class ClawMonitorTUI:
             agent_kind = self._agent_kind(agent_id)
             by_agent.setdefault((agent_id, agent_kind), []).append(sv)
 
+        cron_by_agent: Dict[str, List[CronJob]] = {}
+        snap = self.model.cron_snapshot
+        if snap:
+            for job in snap.jobs_by_id.values():
+                aid = (job.agent_id or "main").strip() if job.agent_id else "main"
+                cron_by_agent.setdefault(aid, []).append(job)
+
         def sess_sort_key(sv: "SessionView") -> Tuple[int, str, str]:
             info = parse_session_key(sv.meta.key)
             kind = info.kind
@@ -815,7 +857,8 @@ class ClawMonitorTUI:
         items: List[ListItem] = []
         for (agent_id, agent_kind) in sorted(by_agent.keys(), key=lambda x: (x[1] != "configured", x[0])):
             rows = sorted(by_agent[(agent_id, agent_kind)], key=sess_sort_key)
-            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows)))
+            cron_count = len(cron_by_agent.get(agent_id, []))
+            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows), cron_count=cron_count))
             for sv in rows:
                 items.append(
                     _ListSession(
@@ -825,6 +868,11 @@ class ClawMonitorTUI:
                         key_tail=self._display_key_tail(sv),
                     )
                 )
+            if self.show_cron and cron_count:
+                jobs = sorted(cron_by_agent.get(agent_id, []), key=lambda j: (j.enabled is False, (j.name or ""), j.id))
+                runs = self.model.cron_last_runs
+                for job in jobs:
+                    items.append(_ListCronJob(agent_id=agent_id, job=job, last_run=runs.get(job.id)))
         return items
 
     def _is_selectable(self, item: ListItem) -> bool:
@@ -1004,8 +1052,32 @@ class ClawMonitorTUI:
                 continue
             it = items[idx]
             if isinstance(it, _ListHeader):
-                line = f"{self._agent_label(it.agent_id)} ({it.agent_kind})  sessions={it.count}"
+                extra = f"  cron={it.cron_count}" if it.cron_count else ""
+                line = f"{self._agent_label(it.agent_id)} ({it.agent_kind})  sessions={it.count}{extra}"
                 self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w, curses.A_BOLD)
+                continue
+            if isinstance(it, _ListCronJob):
+                job = it.job
+                indent = "  " * 1
+                node_text = f"{indent}- cron"
+                status = (it.last_run.status or "-") if it.last_run else "-"
+                status = status.upper()[:11]
+                run_dt = _dt_from_ms(it.last_run.ts_ms) if it.last_run else None
+                run_age = _fmt_age(_age_seconds(run_dt))
+                flags_list: List[str] = ["CRONJOB"]
+                if job.enabled is False:
+                    flags_list.append("DISABLED")
+                flags = ",".join(flags_list)
+                name = job.name or job.id
+                sess = f"{name} ({job.id[:8]})"
+                line = (
+                    f"{_fit(node_text, node_w)}  "
+                    f"{_fit(status, state_w)}  "
+                    f"{'-':>5}  {'-':>5}  {run_age:>5}  "
+                    f"{_fit(flags, flags_w)}  "
+                    f"{sess}"
+                )
+                self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w)
                 continue
 
             sv = it.sv
@@ -1525,6 +1597,7 @@ class ClawMonitorTUI:
             "  r              Refresh now",
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  t              Toggle tree view (group by agent)",
+            "  c              Toggle cron jobs in tree view",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
@@ -1693,6 +1766,10 @@ class ClawMonitorTUI:
                 self.tree_view = not self.tree_view
                 self.scroll = 0
                 dirty = True
+            elif ch == ord("c"):
+                self.show_cron = not self.show_cron
+                self.scroll = 0
+                dirty = True
             elif ch == ord("?"):
                 self._help_overlay(stdscr)
                 dirty = True
@@ -1776,7 +1853,8 @@ class ClawMonitorTUI:
                 refresh_note = f" refreshErr={err[:40]}"
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
+                f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                f"[Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

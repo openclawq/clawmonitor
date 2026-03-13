@@ -63,6 +63,11 @@ clawmonitor watch --interval 1
 
 示例配置：`config.example.toml`
 
+### 可选：自定义标签
+
+你可以给很长的 sessionKey（例如飞书 `ou_...`）配置一个更友好的名字。
+见 `config.example.toml` 中的 `[labels]` 说明。
+
 运行时数据（不会写进本仓库）：
 
 - 事件日志：`~/.local/state/clawmonitor/events.jsonl`
