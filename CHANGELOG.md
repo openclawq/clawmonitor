@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- TUI: tree view in the left list (group sessions by agent; highlight ACP/subagent via indentation).
+- TUI: highlight `Task:` / `Thinking:` / `Trigger:` lines in the right status panel (magenta).
+- TUI: better narrow-terminal behavior by showing sessionKey “tail” in the list (reduces truncation pain).
+
 ## 0.1.3
 
 - PyPI: trusted publishing workflow uses GitHub Environment `pypi` and supports manual `workflow_dispatch`.

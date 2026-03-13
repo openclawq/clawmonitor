@@ -39,8 +39,11 @@ clawmonitor nudge --session-key 'agent:main:main' --template progress
 clawmonitor nudge --session-key 'agent:main:main' --template continue
 clawmonitor push --session-key 'agent:main:main' --dry-run
 clawmonitor status
+clawmonitor status --detail
 clawmonitor status --format json
 clawmonitor status --format md
+clawmonitor status --format md --detail
+clawmonitor tree
 clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
 ```
@@ -64,6 +67,7 @@ Runtime data (NOT stored in this repo):
 - `↑/↓`: move selection
 - `Enter`: nudge selected session (choose template)
 - `?`: show help overlay
+- `t`: toggle tree view (group by agent)
 - `l`: toggle related logs panel
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session
@@ -72,6 +76,7 @@ Runtime data (NOT stored in this repo):
 - `q`: quit
 
 Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
+In the details panel, `Task:` / `Thinking:` lines are highlighted (magenta when supported).
 
 ## Telegram note: ACP “thread bindings”
 
@@ -99,5 +104,6 @@ See `docs/launch-post.md` for a longer intro.
 - ClawMonitor never prints or writes OpenClaw secrets. It avoids dumping `openclaw.json` and redacts suspicious token-like strings in logs/reports.
 - If Gateway is unreachable, ClawMonitor still works in offline mode (sessions/transcripts/locks/delivery-queue) but disables log tail + nudge.
 - If your terminal window is narrow, `clawmonitor tui` may hide the details panel; use `clawmonitor status` as a stable fallback.
+- For ClawHub import, see `docs/clawhub-skill.md` and `skills/claw-monitor/SKILL.md`.
 
 See `CONTRIBUTORS.md` for acknowledgements.

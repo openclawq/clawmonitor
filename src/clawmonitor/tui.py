@@ -4,9 +4,10 @@ import curses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import time
 import re
+import unicodedata
 
 from .actions import TEMPLATES, send_nudge
 from .channels_status import ChannelsSnapshot, fetch_channels_status
@@ -16,7 +17,9 @@ from .diagnostics import Finding, diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .locks import LockInfo, lock_path_for_session_file, read_lock
+from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
 from .redact import redact_text
+from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .state import SessionComputed, WorkState, compute_state
@@ -58,11 +61,12 @@ def _fmt_age(age: Optional[int]) -> str:
 def _fit(text: str, width: int) -> str:
     if width <= 0:
         return ""
-    if len(text) <= width:
-        return text.ljust(width)
+    s = text or ""
+    if _display_width(s) <= width:
+        return _pad_right_cells(s, width)
     if width <= 1:
-        return text[:width]
-    return (text[: width - 1] + "…")[:width]
+        return _truncate_cells(s, width)
+    return _truncate_cells(s, width - 1) + "…"
 
 
 def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
@@ -72,45 +76,132 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
     if not t:
         return []
     words = t.split()
-    # If there are no whitespace splits (common for CJK), treat as a single chunk.
-    if len(words) <= 1 and len(t) > width:
+    if len(words) <= 1:
         words = [t]
+
     lines: List[str] = []
     cur: List[str] = []
-    cur_len = 0
-    for w in words:
-        if len(w) > width:
-            # Break long tokens into width-sized chunks to avoid a single unwrapped line.
+    cur_w = 0
+    truncated = False
+
+    for word in words:
+        ww = _display_width(word)
+        if ww > width:
             if cur:
-                lines.append(" ".join(cur)[:width])
+                lines.append(_truncate_cells(" ".join(cur), width))
                 cur = []
-                cur_len = 0
+                cur_w = 0
                 if len(lines) >= max_lines:
+                    truncated = True
                     break
-            for i in range(0, len(w), width):
-                lines.append(w[i : i + width])
+            for chunk in _split_cells(word, width):
+                lines.append(chunk)
                 if len(lines) >= max_lines:
+                    if chunk != word:
+                        truncated = True
                     break
+            if len(lines) >= max_lines:
+                if word not in lines:
+                    truncated = True
+                break
             continue
+
         if not cur:
-            cur = [w]
-            cur_len = len(w)
-        elif cur_len + 1 + len(w) <= width:
-            cur.append(w)
-            cur_len += 1 + len(w)
+            cur = [word]
+            cur_w = ww
         else:
-            lines.append(" ".join(cur)[:width])
-            cur = [w]
-            cur_len = len(w)
+            if cur_w + 1 + ww <= width:
+                cur.append(word)
+                cur_w += 1 + ww
+            else:
+                lines.append(_truncate_cells(" ".join(cur), width))
+                if len(lines) >= max_lines:
+                    truncated = True
+                    cur = []
+                    cur_w = 0
+                    break
+                cur = [word]
+                cur_w = ww
+
         if len(lines) >= max_lines:
+            truncated = True
             break
+
     if len(lines) < max_lines and cur:
-        lines.append(" ".join(cur)[:width])
-    if len(lines) == max_lines:
+        lines.append(_truncate_cells(" ".join(cur), width))
+
+    if truncated and lines:
+        # Ensure ellipsis on the last visible line.
         last = lines[-1]
-        if last and not last.endswith("…") and width >= 1 and len(last) == width:
-            lines[-1] = (last[: max(0, width - 1)] + "…")[:width]
+        if width >= 2:
+            last = _truncate_cells(last, width - 1) + "…"
+        else:
+            last = _truncate_cells(last, width)
+        lines[-1] = last
     return lines
+
+
+def _cell_width(ch: str) -> int:
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in ("W", "F"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    s = text or ""
+    total = 0
+    for ch in s:
+        total += _cell_width(ch)
+    return total
+
+
+def _truncate_cells(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    s = text or ""
+    out: List[str] = []
+    used = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def _pad_right_cells(text: str, width: int) -> str:
+    s = text or ""
+    used = _display_width(s)
+    if used >= width:
+        return _truncate_cells(s, width)
+    return s + (" " * (width - used))
+
+
+def _split_cells(text: str, width: int) -> List[str]:
+    if width <= 0:
+        return []
+    s = text or ""
+    out: List[str] = []
+    cur: List[str] = []
+    used = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if cur and used + cw > width:
+            out.append("".join(cur))
+            cur = [ch]
+            used = cw
+        else:
+            cur.append(ch)
+            used += cw
+    if cur:
+        out.append("".join(cur))
+    return out
 
 
 def _sanitize_for_curses(text: str) -> str:
@@ -167,13 +258,17 @@ def _channel_account_info(
     return None
 
 
-def _agent_markers(meta: SessionMeta) -> List[str]:
+def _agent_markers(meta: SessionMeta, cfg_snapshot: Optional[OpenClawConfigSnapshot]) -> List[str]:
     markers: List[str] = []
-    kind = ((meta.kind or "") + " " + (meta.chat_type or "")).lower()
+    info = parse_session_key(meta.key)
+    if info.kind == "subagent":
+        markers.append(f"SUB{max(1, info.subagent_depth)}")
+    if info.kind == "acp":
+        markers.append("ACP")
+    if cfg_snapshot and not cfg_snapshot.configured_agent_ids.get(meta.agent_id, False):
+        markers.append("IMPL")
     aid = (meta.agent_id or "").lower()
-    if "subagent" in kind or "sub-agent" in kind:
-        markers.append("SUBAG")
-    if "codex" in kind or aid.startswith("codex") or "codex" in aid:
+    if aid == "codex" or aid.startswith("codex"):
         markers.append("CODEX")
     return markers
 
@@ -241,6 +336,8 @@ class MonitorModel:
         self._channels_last_poll = 0.0
         self._telegram_bindings: Dict[str, Dict[str, TelegramThreadBinding]] = {}
         self._telegram_bindings_last_load = 0.0
+        self._cfg_snapshot: Optional[OpenClawConfigSnapshot] = None
+        self._cfg_snapshot_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -249,6 +346,10 @@ class MonitorModel:
     @property
     def channels(self) -> Optional[ChannelsSnapshot]:
         return self._channels
+
+    @property
+    def config_snapshot(self) -> Optional[OpenClawConfigSnapshot]:
+        return self._cfg_snapshot
 
     @property
     def sessions(self) -> List[SessionView]:
@@ -278,7 +379,7 @@ class MonitorModel:
 
     def _tail_for(self, session_file: Optional[Path]) -> TranscriptTail:
         if not session_file:
-            return TranscriptTail(None, None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None, None)
         try:
             st = session_file.stat()
             key = session_file
@@ -289,7 +390,7 @@ class MonitorModel:
             self._tail_cache[key] = (st.st_mtime, st.st_size, tail)
             return tail
         except Exception:
-            return TranscriptTail(None, None, None, None, None, None)
+            return TranscriptTail(None, None, None, None, None, None, None)
 
     def _refresh_telegram_bindings(self) -> None:
         # Lightweight local file read; throttle to avoid needless IO.
@@ -301,6 +402,16 @@ class MonitorModel:
         bindings = load_telegram_thread_bindings(self.cfg.openclaw_root, account_id="default")
         self._telegram_bindings = {"default": bindings}
         self._telegram_bindings_last_load = now
+
+    def _refresh_config_snapshot(self) -> None:
+        now = time.time()
+        if now - self._cfg_snapshot_last_load < 2.0:
+            return
+        try:
+            self._cfg_snapshot = read_openclaw_config_snapshot(self.cfg.openclaw_root)
+        except Exception:
+            self._cfg_snapshot = None
+        self._cfg_snapshot_last_load = now
 
     def _telegram_binding_for(self, *, account_id: Optional[str], to: Optional[str]) -> Optional[TelegramThreadBinding]:
         if not to or not isinstance(to, str) or not to.startswith("telegram:"):
@@ -316,6 +427,7 @@ class MonitorModel:
         self._refresh_gateway_logs()
         self._refresh_channels()
         self._refresh_telegram_bindings()
+        self._refresh_config_snapshot()
 
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
@@ -325,7 +437,14 @@ class MonitorModel:
             tail = self._tail_for(meta.session_file)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
             df = self._delivery_map.get(meta.key)
-            computed = compute_state(meta.aborted_last_run, tail, lock, df)
+            safeguard_ok = True
+            try:
+                if self._cfg_snapshot:
+                    compaction_cfg = self._cfg_snapshot.compaction_by_agent.get(meta.agent_id) or self._cfg_snapshot.compaction_by_agent.get("main")
+                    safeguard_ok = bool(compaction_cfg and compaction_cfg.mode == "safeguard")
+            except Exception:
+                safeguard_ok = True
+            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
             findings = diagnose(
                 session_key=meta.key,
                 channel=meta.channel,
@@ -359,6 +478,24 @@ class MonitorModel:
         self._sessions = views
 
 
+@dataclass(frozen=True)
+class _ListHeader:
+    agent_id: str
+    agent_kind: str  # configured|implicit
+    count: int
+
+
+@dataclass(frozen=True)
+class _ListSession:
+    sv: "SessionView"
+    indent_units: int
+    node_label: str
+    key_tail: str
+
+
+ListItem = Union[_ListHeader, _ListSession]
+
+
 class ClawMonitorTUI:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -366,7 +503,9 @@ class ClawMonitorTUI:
         self.model = MonitorModel(cfg, self.elog)
         self.selected = 0
         self.scroll = 0
+        self.selected_session_key: Optional[str] = None
         self.show_logs = True
+        self.tree_view = True
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -374,9 +513,132 @@ class ClawMonitorTUI:
         self._color_working = 0
         self._color_idle = 0
         self._color_alert = 0
+        self._color_magenta = 0
 
     def run(self) -> None:
         curses.wrapper(self._main)
+
+    def _agent_kind(self, agent_id: str) -> str:
+        snap = self.model.config_snapshot
+        if snap and snap.configured_agent_ids.get(agent_id):
+            return "configured"
+        return "implicit"
+
+    def _indent_units_for(self, session_key: str) -> int:
+        info = parse_session_key(session_key)
+        if info.kind == "subagent":
+            depth = max(1, info.subagent_depth)
+            return 1 + depth
+        if info.kind == "acp":
+            return 2
+        return 1
+
+    def _key_tail(self, session_key: str, *, agent_id: str) -> str:
+        key = (session_key or "").strip()
+        prefix = f"agent:{agent_id}:"
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+        return key
+
+    def _node_label_for(self, sv: "SessionView") -> str:
+        info = parse_session_key(sv.meta.key)
+        if info.kind == "channel":
+            return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        return info.kind
+
+    def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
+        if not self.tree_view:
+            return [
+                _ListSession(sv=sv, indent_units=0, node_label=(sv.meta.agent_id or "-"), key_tail=sv.meta.key)
+                for sv in sessions
+            ]
+
+        by_agent: Dict[Tuple[str, str], List["SessionView"]] = {}
+        for sv in sessions:
+            agent_id = sv.meta.agent_id or "-"
+            agent_kind = self._agent_kind(agent_id)
+            by_agent.setdefault((agent_id, agent_kind), []).append(sv)
+
+        def sess_sort_key(sv: "SessionView") -> Tuple[int, str, str]:
+            info = parse_session_key(sv.meta.key)
+            kind = info.kind
+            order = {
+                "main": 0,
+                "channel": 1,
+                "heartbeat": 2,
+                "acp": 3,
+                "subagent": 4,
+                "unknown": 9,
+            }.get(kind, 9)
+            surface = (sv.meta.channel or info.channel or kind or "-").lower()
+            return (order, surface, sv.meta.key)
+
+        items: List[ListItem] = []
+        for (agent_id, agent_kind) in sorted(by_agent.keys(), key=lambda x: (x[1] != "configured", x[0])):
+            rows = sorted(by_agent[(agent_id, agent_kind)], key=sess_sort_key)
+            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows)))
+            for sv in rows:
+                items.append(
+                    _ListSession(
+                        sv=sv,
+                        indent_units=self._indent_units_for(sv.meta.key),
+                        node_label=self._node_label_for(sv),
+                        key_tail=self._key_tail(sv.meta.key, agent_id=agent_id),
+                    )
+                )
+        return items
+
+    def _is_selectable(self, item: ListItem) -> bool:
+        return isinstance(item, _ListSession)
+
+    def _selected_session(self, items: List[ListItem]) -> Optional["SessionView"]:
+        if not items or self.selected < 0 or self.selected >= len(items):
+            return None
+        it = items[self.selected]
+        if isinstance(it, _ListSession):
+            return it.sv
+        return None
+
+    def _reconcile_selection(self, items: List[ListItem]) -> None:
+        if not items:
+            self.selected = 0
+            self.scroll = 0
+            self.selected_session_key = None
+            return
+
+        if self.selected_session_key:
+            for i, it in enumerate(items):
+                if isinstance(it, _ListSession) and it.sv.meta.key == self.selected_session_key:
+                    self.selected = i
+                    return
+
+        for i, it in enumerate(items):
+            if self._is_selectable(it):
+                self.selected = i
+                if isinstance(items[i], _ListSession):
+                    self.selected_session_key = items[i].sv.meta.key
+                return
+        self.selected = 0
+        self.selected_session_key = None
+
+    def _move_selection(self, items: List[ListItem], delta: int) -> None:
+        if not items:
+            return
+        i = self.selected
+        step = 1 if delta > 0 else -1
+        remaining = abs(delta)
+        while remaining > 0:
+            j = i + step
+            while 0 <= j < len(items) and not self._is_selectable(items[j]):
+                j += step
+            if j < 0 or j >= len(items):
+                break
+            i = j
+            remaining -= 1
+        self.selected = max(0, min(len(items) - 1, i))
+        sv = self._selected_session(items)
+        if sv:
+            self.selected_session_key = sv.meta.key
 
     def _row_attr(self, health_cls: str, *, selected: bool) -> int:
         attr = curses.A_NORMAL
@@ -407,12 +669,13 @@ class ClawMonitorTUI:
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        # Keep a 1-col margin to avoid curses wrapping long/wide strings into the
+        # Keep a small margin to avoid curses wrapping long/wide strings into the
         # next line (which can visually "spill" into the left pane).
-        maxw = min(width, max(0, w - x - 1))
+        maxw = min(width, max(0, w - x - 2))
         if maxw <= 0:
             return
         text = _sanitize_for_curses(text)
+        text = _truncate_cells(text, maxw)
         try:
             if attr:
                 stdscr.addnstr(y, x, text, maxw, attr)
@@ -433,15 +696,14 @@ class ClawMonitorTUI:
             err = self.model.gateway_log_tailer.last_error
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
 
-    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, sessions: List[SessionView]) -> None:
-        agent_w = 10
-        chan_w = 8
+    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
+        node_w = max(12, min(24, int(w * 0.24)))
         state_w = 11
-        flags_w = 12
-        header = f"{_fit('AGENT', agent_w)}  {_fit('CHAN', chan_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
+        flags_w = max(10, min(18, int(w * 0.22)))
+        header = f"{_fit('NODE', node_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
-        visible = h - 1
+        visible = max(0, h - 1)
         if self.selected < self.scroll:
             self.scroll = self.selected
         if self.selected >= self.scroll + visible:
@@ -449,11 +711,17 @@ class ClawMonitorTUI:
         for i in range(visible):
             idx = self.scroll + i
             row_y = body_y + i
-            if idx >= len(sessions):
+            if idx >= len(items):
                 self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
                 continue
-            sv = sessions[idx]
-            user_msg = sv.tail.last_user_send or sv.tail.last_user
+            it = items[idx]
+            if isinstance(it, _ListHeader):
+                line = f"{it.agent_id} ({it.agent_kind})  sessions={it.count}"
+                self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w, curses.A_BOLD)
+                continue
+
+            sv = it.sv
+            user_msg = sv.tail.last_user_send
             u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
@@ -480,15 +748,16 @@ class ClawMonitorTUI:
                 flags.append("TRXM")
             if sv.telegram_routed_elsewhere:
                 flags.append("BIND")
-            flags.extend(_agent_markers(sv.meta))
+            flags.extend(_agent_markers(sv.meta, self.model.config_snapshot))
             flag_str = ",".join(flags)
+            indent = "  " * max(0, it.indent_units)
+            node_text = f"{indent}- {it.node_label}"
             line = (
-                f"{_fit(sv.meta.agent_id, agent_w)}  "
-                f"{_fit((sv.meta.channel or '-'), chan_w)}  "
+                f"{_fit(node_text, node_w)}  "
                 f"{_fit(sv.computed.state.value, state_w)}  "
                 f"{u_age:>5}  {a_age:>5}  {run:>5}  "
                 f"{_fit(flag_str, flags_w)}  "
-                f"{sv.meta.key}"
+                f"{it.key_tail}"
             )
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
@@ -497,9 +766,13 @@ class ClawMonitorTUI:
         if not sv:
             return
         rel_logs: List[str] = []
+        last_activity: Optional[str] = None
         if self.show_logs:
             rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
             rel_logs = [ln.text for ln in rel][-20:]
+            if rel:
+                ln = rel[-1]
+                last_activity = (ln.text or ln.raw or "").strip()
 
         log_budget = 0
         if self.show_logs:
@@ -511,9 +784,9 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
 
         if w >= 110 and detail_h >= 14:
-            self._draw_details_status_split3(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+            self._draw_details_status_split3(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv, last_activity=last_activity)
         elif w >= 24 and detail_h >= 14:
-            self._draw_details_status_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
+            self._draw_details_status_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv, last_activity=last_activity)
         else:
             self._draw_details_stacked(stdscr, x=x, y=y, h=detail_h, w=w, sv=sv)
 
@@ -529,7 +802,7 @@ class ClawMonitorTUI:
     def _draw_details_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
         lines: List[str] = []
         lines.append(f"SessionKey: {sv.meta.key}")
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
         if sv.meta.kind or sv.meta.chat_type:
@@ -582,7 +855,17 @@ class ClawMonitorTUI:
         for i in range(min(h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
 
-    def _draw_details_status_split3(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+    def _draw_details_status_split3(
+        self,
+        stdscr: "curses._CursesWindow",
+        x: int,
+        y: int,
+        h: int,
+        w: int,
+        sv: SessionView,
+        *,
+        last_activity: Optional[str],
+    ) -> None:
         # Top status block spans width; bottom has 3 columns:
         # Last User Send | Last Claw Send | Last Trigger
         status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
@@ -603,7 +886,7 @@ class ClawMonitorTUI:
 
         # Status header + lines
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
@@ -612,6 +895,21 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        # Task summary (best-effort): show what the agent is working on right now.
+        if sv.lock:
+            task_src = sv.tail.last_user_send
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
+            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
+                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
+                status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
         acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
         if acct_info:
             in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
@@ -644,7 +942,11 @@ class ClawMonitorTUI:
             status_lines.append("Diagnosis: (none)")
 
         for i in range(min(status_h - 1, len(status_lines))):
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+            ln = status_lines[i]
+            attr = 0
+            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+                attr = self._color_magenta if self._colors_enabled else 0
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         if msg_h <= 2:
             return
@@ -691,7 +993,17 @@ class ClawMonitorTUI:
         for i in range(min(body_h, len(trig_lines))):
             self._safe_addnstr(stdscr, y_msgs + 1 + i, x3, _fit(trig_lines[i], col3), col3)
 
-    def _draw_details_status_stacked(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+    def _draw_details_status_stacked(
+        self,
+        stdscr: "curses._CursesWindow",
+        x: int,
+        y: int,
+        h: int,
+        w: int,
+        sv: SessionView,
+        *,
+        last_activity: Optional[str],
+    ) -> None:
         # Stacked panes: Status / Last User Send / Last Claw Send / Last Trigger
         status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
         user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
@@ -722,7 +1034,7 @@ class ClawMonitorTUI:
 
         # Status
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta)
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
@@ -731,6 +1043,21 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.lock:
+            task_src = sv.tail.last_user_send
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
+            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
+                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                status_lines.extend(
+                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
+                )
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
         acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
         if acct_info:
             in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
@@ -749,7 +1076,11 @@ class ClawMonitorTUI:
         if sv.findings:
             status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
         for i in range(min(status_h - 1, len(status_lines))):
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+            ln = status_lines[i]
+            attr = 0
+            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+                attr = self._color_magenta if self._colors_enabled else 0
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         # Last User Send
         self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
@@ -790,6 +1121,7 @@ class ClawMonitorTUI:
     def _template_picker(self, stdscr: "curses._CursesWindow") -> Optional[str]:
         items = list(TEMPLATES.keys())
         idx = 0
+        scroll = 0
         h, w = stdscr.getmaxyx()
         win_h = min(10, h - 4)
         win_w = min(70, w - 4)
@@ -800,11 +1132,18 @@ class ClawMonitorTUI:
         while True:
             win.clear()
             win.border()
-            win.addnstr(0, 2, " Nudge template ", win_w - 4)
-            for i, name in enumerate(items[: win_h - 2]):
-                attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-                preview = TEMPLATES[name][: (win_w - 6)]
-                win.addnstr(1 + i, 2, f"{name}: {preview}".ljust(win_w - 4), win_w - 4, attr)
+            self._safe_addnstr(win, 0, 2, " Nudge template ", win_w - 4)
+            visible = max(1, win_h - 2)
+            if idx < scroll:
+                scroll = idx
+            if idx >= scroll + visible:
+                scroll = idx - visible + 1
+            view = items[scroll : scroll + visible]
+            for i, name in enumerate(view):
+                real_idx = scroll + i
+                attr = curses.A_REVERSE if real_idx == idx else curses.A_NORMAL
+                preview = TEMPLATES[name]
+                self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(f"{name}: {preview}", win_w - 4), win_w - 4, attr)
             win.refresh()
             ch = win.getch()
             if ch in (27, ord("q")):
@@ -827,10 +1166,15 @@ class ClawMonitorTUI:
             "Actions:",
             "  r              Refresh now",
             "  f              Cycle refresh interval (up to 10 minutes)",
+            "  t              Toggle tree view (group by agent)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
             "  d              Re-run diagnosis (forces refresh)",
+            "",
+            "Left list columns:",
+            "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
+            "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
             "Health labels (FLAGS column):",
             "  OK     Normal / completed",
@@ -858,13 +1202,13 @@ class ClawMonitorTUI:
             win.clear()
             win.border()
             try:
-                win.addnstr(0, 2, " Help ", win_w - 4)
+                self._safe_addnstr(win, 0, 2, " Help ", win_w - 4)
             except curses.error:
                 pass
             view = lines[scroll : scroll + (win_h - 2)]
             for i, ln in enumerate(view):
                 try:
-                    win.addnstr(1 + i, 2, ln.ljust(win_w - 4), win_w - 4)
+                    self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(ln, win_w - 4), win_w - 4)
                 except curses.error:
                     pass
             win.refresh()
@@ -912,11 +1256,13 @@ class ClawMonitorTUI:
                 curses.init_pair(2, curses.COLOR_YELLOW, -1)
                 curses.init_pair(3, curses.COLOR_CYAN, -1)
                 curses.init_pair(4, curses.COLOR_RED, -1)
+                curses.init_pair(5, curses.COLOR_MAGENTA, -1)
                 self._colors_enabled = True
                 self._color_ok = curses.color_pair(1)
                 self._color_working = curses.color_pair(3)
                 self._color_idle = curses.color_pair(2)
                 self._color_alert = curses.color_pair(4)
+                self._color_magenta = curses.color_pair(5)
         except Exception:
             self._colors_enabled = False
         stdscr.timeout(200)
@@ -932,10 +1278,8 @@ class ClawMonitorTUI:
                 dirty = True
 
             sessions = self.model.sessions
-            if sessions and self.selected >= len(sessions):
-                self.selected = len(sessions) - 1
-            if self.selected < 0:
-                self.selected = 0
+            items = self._build_list_items(sessions)
+            self._reconcile_selection(items)
 
             try:
                 ch = stdscr.getch()
@@ -950,10 +1294,10 @@ class ClawMonitorTUI:
             if ch in (ord("q"), 27):
                 return
             if ch in (curses.KEY_UP, ord("k")):
-                self.selected = max(0, self.selected - 1)
+                self._move_selection(items, -1)
                 dirty = True
             elif ch in (curses.KEY_DOWN, ord("j")):
-                self.selected = min(len(sessions) - 1, self.selected + 1) if sessions else 0
+                self._move_selection(items, 1)
                 dirty = True
             elif ch == ord("r"):
                 self.model.refresh()
@@ -976,11 +1320,15 @@ class ClawMonitorTUI:
                     i = 2
                 self.refresh_seconds = opts[(i + 1) % len(opts)]
                 dirty = True
+            elif ch == ord("t"):
+                self.tree_view = not self.tree_view
+                self.scroll = 0
+                dirty = True
             elif ch == ord("?"):
                 self._help_overlay(stdscr)
                 dirty = True
             elif ch in (ord("e"), 10, 13):
-                sv = sessions[self.selected] if sessions else None
+                sv = self._selected_session(items)
                 if ch == ord("e") and sv:
                     self._export_report(sv)
                     dirty = True
@@ -1002,6 +1350,10 @@ class ClawMonitorTUI:
             if not dirty:
                 continue
 
+            # Rebuild in case view toggles changed.
+            items = self._build_list_items(self.model.sessions)
+            self._reconcile_selection(items)
+
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             self._draw_header(stdscr, w)
@@ -1009,8 +1361,8 @@ class ClawMonitorTUI:
             list_h = h - 3
             list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
             detail_w = w - list_w - 1
-            self._draw_list(stdscr, y=2, h=list_h, w=list_w, sessions=sessions)
-            sv = sessions[self.selected] if sessions else None
+            self._draw_list(stdscr, y=2, h=list_h, w=list_w, items=items)
+            sv = self._selected_session(items)
             if detail_w >= 24 and list_w < w - 1:
                 try:
                     stdscr.vline(2, list_w, curses.ACS_VLINE, max(0, h - 3))
@@ -1029,9 +1381,17 @@ class ClawMonitorTUI:
             refresh_age = "-"
             if self._last_refresh_at is not None:
                 refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
+            selectable = [it for it in items if isinstance(it, _ListSession)]
+            sel_total = len(selectable)
+            sel_pos = 0
+            if sv and sel_total:
+                try:
+                    sel_pos = 1 + [x.sv.meta.key for x in selectable].index(sv.meta.key)
+                except ValueError:
+                    sel_pos = 0
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[Enter]nudge [e]export [l]logs  sel={self.selected+1}/{len(sessions)} lastRefresh={refresh_age}"
+                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

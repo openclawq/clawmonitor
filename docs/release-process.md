@@ -14,6 +14,12 @@ This repo is configured for **automatic PyPI publishing** using PyPI “Trusted 
 
 ## Standard release flow
 
+Suggested workflow:
+
+- Do day-to-day development on `dev`.
+- Merge to `main` only when ready to release.
+- Publish to PyPI by tagging on `main`.
+
 1) Update version + changelog
 
 - Bump `pyproject.toml` → `[project].version`
@@ -77,4 +83,3 @@ Check PyPI publisher settings match exactly:
 - Repository: `openclawq/clawmonitor`
 - Workflow filename: `pypi-publish.yml`
 - Environment name: `pypi`
-

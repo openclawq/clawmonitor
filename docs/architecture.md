@@ -22,7 +22,7 @@ Telegram routing (local state):
 
 ## Outputs
 
-- TUI: `clawmonitor tui` (color-coded rows, footer hotkeys, manual refresh and interval cycling)
+- TUI: `clawmonitor tui` (tree view grouped by agent, color-coded rows, footer hotkeys, manual refresh and interval cycling)
 - CLI status: `clawmonitor status --format text|json|md`
 - Export single-session report: `clawmonitor report --session-key ... --format json|md|both`
   - Written under `~/.local/state/clawmonitor/reports/` by default (XDG state dir)

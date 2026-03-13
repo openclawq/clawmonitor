@@ -22,6 +22,7 @@ from .state import compute_state
 from .status_cli import collect_status, format_json as format_status_json, format_markdown as format_status_markdown, format_table, watch_loop
 from .transcript_tail import TranscriptTail, tail_transcript
 from .tui import ClawMonitorTUI
+from .tree_cli import format_tree
 
 
 def _config_with_overrides(cfg_path: Optional[str], openclaw_root: Optional[str]) -> Any:
@@ -136,9 +137,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.format == "json":
         print(format_status_json(rows, cfg.openclaw_root))
     elif args.format == "md":
-        print(format_status_markdown(rows, limit=args.limit))
+        print(format_status_markdown(rows, limit=args.limit, detail=bool(args.detail)))
     else:
-        print(format_table(rows, limit=args.limit))
+        print(format_table(rows, limit=args.limit, detail=bool(args.detail)))
     return 0
 
 
@@ -149,7 +150,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not meta:
         raise SystemExit(f"Unknown sessionKey: {args.session_key}")
 
-    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None, None)
+    tail = (
+        tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes)
+        if meta.session_file
+        else TranscriptTail(None, None, None, None, None, None, None)
+    )
     user_msg = tail.last_user_send or tail.last_user
     lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
     delivery_map = load_failed_delivery_map(cfg.openclaw_root)
@@ -216,6 +221,19 @@ def cmd_report(args: argparse.Namespace) -> int:
     else:
         for k, p in paths.items():
             print(f"{k}: {p}")
+    return 0
+
+
+def cmd_tree(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    rows = collect_status(
+        openclaw_root=cfg.openclaw_root,
+        openclaw_bin=cfg.openclaw_bin,
+        transcript_tail_bytes=cfg.transcript_tail_bytes,
+        hide_system_sessions=args.hide_system if args.hide_system is not None else cfg.hide_system_sessions,
+        include_gateway_channels=not args.no_gateway,
+    )
+    print(format_tree(rows, include_task=not bool(args.no_task)))
     return 0
 
 
@@ -324,9 +342,16 @@ def main() -> None:
     status = sub.add_parser("status", help="Print computed per-session core status (no curses)")
     status.add_argument("--format", choices=["text", "json", "md"], default="text")
     status.add_argument("--limit", type=int, help="Max sessions to print (text only)")
+    status.add_argument("--detail", action="store_true", help="Include task and message previews (text/md only)")
     status.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     status.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     status.set_defaults(func=cmd_status)
+
+    tree = sub.add_parser("tree", help="Print a tree-ish view grouped by agent")
+    tree.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
+    tree.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
+    tree.add_argument("--no-task", action="store_true", help="Do not include task previews")
+    tree.set_defaults(func=cmd_tree)
 
     rep = sub.add_parser("report", help="Export a single-session report (JSON/MD)")
     rep.add_argument("--session-key", required=True)
