@@ -685,6 +685,7 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.tree_view = True
         self.show_cron = True
+        self.node_show_session_label = True
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -1137,7 +1138,17 @@ class ClawMonitorTUI:
             extra = max(0, len(flags) - len(shown_flags))
             flag_str = ",".join(shown_flags) + (f"+{extra}" if extra else "")
             indent = "  " * max(0, it.indent_units)
-            node_text = f"{indent}- {it.node_label}"
+            node_leaf = it.node_label
+            if self.node_show_session_label:
+                info = parse_session_key(sv.meta.key)
+                if info.kind == "channel":
+                    lbl = session_display_label(self.cfg.labels, sv.meta)
+                    if lbl:
+                        suf = _tail_suffix(sv.meta.key, n=4)
+                        # Keep NODE readable even with repeated labels across old sessions.
+                        lbl2 = f"{lbl}({suf})" if suf else lbl
+                        node_leaf = f"{it.node_label}:{lbl2}"
+            node_text = f"{indent}- {node_leaf}"
             line = (
                 f"{_fit(node_text, node_w)}  "
                 f"{_fit(sv.computed.state.value, state_w)}  "
@@ -1739,6 +1750,7 @@ class ClawMonitorTUI:
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
+            "  n              Toggle NODE label mode (channel:label)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
@@ -1911,6 +1923,9 @@ class ClawMonitorTUI:
                 self.show_cron = not self.show_cron
                 self.scroll = 0
                 dirty = True
+            elif ch == ord("n"):
+                self.node_show_session_label = not self.node_show_session_label
+                dirty = True
             elif ch == ord("R"):
                 sv = self._selected_session(items)
                 if sv:
@@ -2000,6 +2015,7 @@ class ClawMonitorTUI:
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
                 f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
                 f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
