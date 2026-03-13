@@ -685,7 +685,7 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.tree_view = True
         self.show_cron = True
-        self.node_show_session_label = True
+        self.node_show_session_label = False
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -1756,6 +1756,12 @@ class ClawMonitorTUI:
             "  l              Toggle related logs panel",
             "  d              Re-run diagnosis (forces refresh)",
             "",
+            "States (STATE column):",
+            "  WORKING        Task is running (lock present or ACPX indicates running).",
+            "  FINISHED       No lock and assistant is not behind user.",
+            "  INTERRUPTED    AbortedLastRun + pending reply (usually a crash/kill).",
+            "  NO_MESSAGE     No real inbound user message detected for this session key.",
+            "",
             "Performance:",
             "  - Refresh runs asynchronously; footer shows refresh progress/errors.",
             "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
@@ -1764,11 +1770,21 @@ class ClawMonitorTUI:
             "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
             "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
-            "Health labels (FLAGS column):",
-            "  OK     Normal / completed",
-            "  RUN    Working (lock present)",
-            "  IDLE   No user message seen",
-            "  ALERT  Abnormal (NOFB / delivery failure / safety / safeguard off / interrupted)",
+            "FLAGS column (compact):",
+            "  First token is a health label:",
+            "    OK     Normal / completed",
+            "    RUN    Working / long-running",
+            "    IDLE   No inbound user message (often channel not bound / wrong session key)",
+            "    ALERT  Needs attention (NOFB / delivery failure / safety / safeguard off / interrupted)",
+            "  Then short flags (may show +N for hidden extras):",
+            "    NOFB   User spoke after last assistant reply (pending response).",
+            "    DLV    Delivery queue has failed outbound message(s).",
+            "    ZLOCK  Lock pid is dead but lock file remains (stale lock).",
+            "    ACPRUN ACP/ACPX run appears to be in progress.",
+            "    SAFE   Provider stop_reason suggests a safety/refusal event.",
+            "    TRXM   Transcript missing (sessionFile path missing).",
+            "    BIND   Telegram thread-binding routes this chat elsewhere.",
+            "    ACP/SUB/CODEX/IMPL/HEARTBEAT identify ACP/subagent/codex/implicit/heartbeat sessions.",
             "",
             "Notes:",
             "  - Related Logs require Gateway logs.tail (online mode).",
