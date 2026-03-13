@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import time
 import re
+import unicodedata
 
 from .actions import TEMPLATES, send_nudge
 from .channels_status import ChannelsSnapshot, fetch_channels_status
@@ -60,11 +61,12 @@ def _fmt_age(age: Optional[int]) -> str:
 def _fit(text: str, width: int) -> str:
     if width <= 0:
         return ""
-    if len(text) <= width:
-        return text.ljust(width)
+    s = text or ""
+    if _display_width(s) <= width:
+        return _pad_right_cells(s, width)
     if width <= 1:
-        return text[:width]
-    return (text[: width - 1] + "…")[:width]
+        return _truncate_cells(s, width)
+    return _truncate_cells(s, width - 1) + "…"
 
 
 def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
@@ -74,45 +76,132 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
     if not t:
         return []
     words = t.split()
-    # If there are no whitespace splits (common for CJK), treat as a single chunk.
-    if len(words) <= 1 and len(t) > width:
+    if len(words) <= 1:
         words = [t]
+
     lines: List[str] = []
     cur: List[str] = []
-    cur_len = 0
-    for w in words:
-        if len(w) > width:
-            # Break long tokens into width-sized chunks to avoid a single unwrapped line.
+    cur_w = 0
+    truncated = False
+
+    for word in words:
+        ww = _display_width(word)
+        if ww > width:
             if cur:
-                lines.append(" ".join(cur)[:width])
+                lines.append(_truncate_cells(" ".join(cur), width))
                 cur = []
-                cur_len = 0
+                cur_w = 0
                 if len(lines) >= max_lines:
+                    truncated = True
                     break
-            for i in range(0, len(w), width):
-                lines.append(w[i : i + width])
+            for chunk in _split_cells(word, width):
+                lines.append(chunk)
                 if len(lines) >= max_lines:
+                    if chunk != word:
+                        truncated = True
                     break
+            if len(lines) >= max_lines:
+                if word not in lines:
+                    truncated = True
+                break
             continue
+
         if not cur:
-            cur = [w]
-            cur_len = len(w)
-        elif cur_len + 1 + len(w) <= width:
-            cur.append(w)
-            cur_len += 1 + len(w)
+            cur = [word]
+            cur_w = ww
         else:
-            lines.append(" ".join(cur)[:width])
-            cur = [w]
-            cur_len = len(w)
+            if cur_w + 1 + ww <= width:
+                cur.append(word)
+                cur_w += 1 + ww
+            else:
+                lines.append(_truncate_cells(" ".join(cur), width))
+                if len(lines) >= max_lines:
+                    truncated = True
+                    cur = []
+                    cur_w = 0
+                    break
+                cur = [word]
+                cur_w = ww
+
         if len(lines) >= max_lines:
+            truncated = True
             break
+
     if len(lines) < max_lines and cur:
-        lines.append(" ".join(cur)[:width])
-    if len(lines) == max_lines:
+        lines.append(_truncate_cells(" ".join(cur), width))
+
+    if truncated and lines:
+        # Ensure ellipsis on the last visible line.
         last = lines[-1]
-        if last and not last.endswith("…") and width >= 1 and len(last) == width:
-            lines[-1] = (last[: max(0, width - 1)] + "…")[:width]
+        if width >= 2:
+            last = _truncate_cells(last, width - 1) + "…"
+        else:
+            last = _truncate_cells(last, width)
+        lines[-1] = last
     return lines
+
+
+def _cell_width(ch: str) -> int:
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in ("W", "F"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    s = text or ""
+    total = 0
+    for ch in s:
+        total += _cell_width(ch)
+    return total
+
+
+def _truncate_cells(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    s = text or ""
+    out: List[str] = []
+    used = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def _pad_right_cells(text: str, width: int) -> str:
+    s = text or ""
+    used = _display_width(s)
+    if used >= width:
+        return _truncate_cells(s, width)
+    return s + (" " * (width - used))
+
+
+def _split_cells(text: str, width: int) -> List[str]:
+    if width <= 0:
+        return []
+    s = text or ""
+    out: List[str] = []
+    cur: List[str] = []
+    used = 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if cur and used + cw > width:
+            out.append("".join(cur))
+            cur = [ch]
+            used = cw
+        else:
+            cur.append(ch)
+            used += cw
+    if cur:
+        out.append("".join(cur))
+    return out
 
 
 def _sanitize_for_curses(text: str) -> str:
@@ -443,6 +532,7 @@ class ClawMonitorTUI:
         if maxw <= 0:
             return
         text = _sanitize_for_curses(text)
+        text = _truncate_cells(text, maxw)
         try:
             if attr:
                 stdscr.addnstr(y, x, text, maxw, attr)
@@ -820,6 +910,7 @@ class ClawMonitorTUI:
     def _template_picker(self, stdscr: "curses._CursesWindow") -> Optional[str]:
         items = list(TEMPLATES.keys())
         idx = 0
+        scroll = 0
         h, w = stdscr.getmaxyx()
         win_h = min(10, h - 4)
         win_w = min(70, w - 4)
@@ -830,11 +921,18 @@ class ClawMonitorTUI:
         while True:
             win.clear()
             win.border()
-            win.addnstr(0, 2, " Nudge template ", win_w - 4)
-            for i, name in enumerate(items[: win_h - 2]):
-                attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-                preview = TEMPLATES[name][: (win_w - 6)]
-                win.addnstr(1 + i, 2, f"{name}: {preview}".ljust(win_w - 4), win_w - 4, attr)
+            self._safe_addnstr(win, 0, 2, " Nudge template ", win_w - 4)
+            visible = max(1, win_h - 2)
+            if idx < scroll:
+                scroll = idx
+            if idx >= scroll + visible:
+                scroll = idx - visible + 1
+            view = items[scroll : scroll + visible]
+            for i, name in enumerate(view):
+                real_idx = scroll + i
+                attr = curses.A_REVERSE if real_idx == idx else curses.A_NORMAL
+                preview = TEMPLATES[name]
+                self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(f"{name}: {preview}", win_w - 4), win_w - 4, attr)
             win.refresh()
             ch = win.getch()
             if ch in (27, ord("q")):
@@ -888,13 +986,13 @@ class ClawMonitorTUI:
             win.clear()
             win.border()
             try:
-                win.addnstr(0, 2, " Help ", win_w - 4)
+                self._safe_addnstr(win, 0, 2, " Help ", win_w - 4)
             except curses.error:
                 pass
             view = lines[scroll : scroll + (win_h - 2)]
             for i, ln in enumerate(view):
                 try:
-                    win.addnstr(1 + i, 2, ln.ljust(win_w - 4), win_w - 4)
+                    self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(ln, win_w - 4), win_w - 4)
                 except curses.error:
                     pass
             win.refresh()

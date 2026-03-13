@@ -45,6 +45,13 @@ _INTERNAL_USER_PATTERNS = [
     re.compile(r"^Sender \(untrusted metadata\):", re.IGNORECASE),
     re.compile(r"^\[Queued messages while agent was busy\]", re.IGNORECASE),
     re.compile(r"^Queued messages while agent was busy", re.IGNORECASE),
+    re.compile(r"^\[ClawMonitor nudge\]", re.IGNORECASE),
+    re.compile(r"^Current time:\s*", re.IGNORECASE),
+    re.compile(
+        r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2}(st|nd|rd|th),\s+\d{4}\s+—\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?\s+\([A-Za-z_]+/[A-Za-z_]+\)", re.IGNORECASE),
 ]
 
 
