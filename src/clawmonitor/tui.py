@@ -336,6 +336,11 @@ def _internal_activity_at(tail: TranscriptTail) -> Optional[datetime]:
     except Exception:
         pass
     try:
+        if tail.last_tool_result and tail.last_tool_result.ts:
+            candidates.append(tail.last_tool_result.ts)
+    except Exception:
+        pass
+    try:
         if tail.last_entry_type and tail.last_entry_type != "message" and tail.last_entry_ts:
             candidates.append(tail.last_entry_ts)
     except Exception:
@@ -1415,6 +1420,13 @@ class ClawMonitorTUI:
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
+                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
+                status_lines.append(f"ToolCall: {names}")
+            if sv.tail.last_tool_result:
+                tr = sv.tail.last_tool_result
+                ok = "err" if tr.is_error else "ok"
+                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
             if sv.tail.last_tool_error:
                 ts, summary = sv.tail.last_tool_error
                 status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
@@ -1427,6 +1439,13 @@ class ClawMonitorTUI:
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
+                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
+                status_lines.append(f"ToolCall: {names}")
+            if sv.tail.last_tool_result:
+                tr = sv.tail.last_tool_result
+                ok = "err" if tr.is_error else "ok"
+                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
             if sv.tail.last_tool_error:
                 ts, summary = sv.tail.last_tool_error
                 status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
@@ -1485,7 +1504,7 @@ class ClawMonitorTUI:
         for i in range(min(max_status_lines, len(visible_status_lines))):
             ln = visible_status_lines[i]
             attr = 0
-            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+            if ln.startswith(("Task:", "Thinking:", "Trigger:", "ToolCall:", "ToolResult:")):
                 attr = self._color_magenta if self._colors_enabled else 0
             elif ln.startswith("Diagnosis:"):
                 if not self._colors_enabled:

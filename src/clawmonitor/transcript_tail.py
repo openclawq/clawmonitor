@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
 
@@ -192,6 +192,21 @@ class TailMessage:
 
 
 @dataclass(frozen=True)
+class ToolResultEvent:
+    ts: Optional[datetime]
+    tool_name: str
+    is_error: bool
+    preview: str
+    tool_call_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    ts: Optional[datetime]
+    tool_names: List[str]
+
+
+@dataclass(frozen=True)
 class TranscriptTail:
     # last_user: the newest role=user message (may include internal triggers).
     last_user: Optional[TailMessage]
@@ -203,9 +218,13 @@ class TranscriptTail:
     last_assistant: Optional[TailMessage]
     last_assistant_thinking: Optional[str]
     last_tool_error: Optional[Tuple[Optional[datetime], str]]
-    last_compaction_at: Optional[datetime]
+    last_compaction_at: Optional[datetime] = None
     last_entry_type: Optional[str] = None
     last_entry_ts: Optional[datetime] = None
+    # last_tool_result: newest toolResult message (success or error).
+    last_tool_result: Optional[ToolResultEvent] = None
+    # last_tool_call: newest assistant message toolCall names (if any).
+    last_tool_call: Optional[ToolCallEvent] = None
 
 
 def _extract_thinking(content: Any, max_chars: int = 400) -> str:
@@ -222,6 +241,32 @@ def _extract_thinking(content: Any, max_chars: int = 400) -> str:
             parts.append(thinking.strip())
     joined = " ".join(parts).strip()
     return joined[:max_chars] if joined else ""
+
+
+def _extract_tool_call_names(content: Any, *, max_calls: int = 6) -> List[str]:
+    """
+    Extract tool call names from an assistant message content list:
+      { "type": "toolCall", "name": "...", ... }
+    """
+    if not isinstance(content, list):
+        return []
+    out: List[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "toolCall":
+            continue
+        nm = item.get("name")
+        if not isinstance(nm, str):
+            continue
+        nm = nm.strip()
+        if not nm:
+            continue
+        if nm not in out:
+            out.append(nm)
+        if len(out) >= max_calls:
+            break
+    return out
 
 
 def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
@@ -264,6 +309,8 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     last_trigger: Optional[TailMessage] = None
     last_assistant: Optional[TailMessage] = None
     last_assistant_thinking: Optional[str] = None
+    last_tool_result: Optional[ToolResultEvent] = None
+    last_tool_call: Optional[ToolCallEvent] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
     last_compaction_at: Optional[datetime] = None
     last_entry_type: Optional[str] = None
@@ -292,16 +339,22 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         role = msg.get("role")
         if role == "toolResult":
             is_error = bool(msg.get("isError", False))
+            tool_name = msg.get("toolName")
+            tool_call_id = msg.get("toolCallId")
+            nm = str(tool_name).strip() if isinstance(tool_name, str) else "tool"
+            if not nm:
+                nm = "tool"
+            preview = _clean_preview(_extract_text(msg.get("content"), max_chars=400))
+            if last_tool_result is None:
+                last_tool_result = ToolResultEvent(
+                    ts=ts,
+                    tool_name=nm,
+                    is_error=is_error,
+                    preview=preview[:240] if preview else "",
+                    tool_call_id=str(tool_call_id) if isinstance(tool_call_id, str) and tool_call_id else None,
+                )
             if is_error and last_tool_error is None:
-                # Keep a short summary; details can be inspected via logs.
-                tool_name = msg.get("toolName")
-                content = msg.get("content")
-                preview = ""
-                if isinstance(content, list) and content:
-                    first = content[0]
-                    if isinstance(first, dict):
-                        preview = first.get("text") or ""
-                summary = f"{tool_name or 'tool'} error: {str(preview)[:160]}".strip()
+                summary = f"{nm} error: {str(preview)[:160]}".strip()
                 last_tool_error = (ts, summary)
             continue
 
@@ -324,6 +377,10 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         if role == "assistant" and last_assistant is None:
             stop_reason = msg.get("stopReason")
             thinking = _extract_thinking(msg.get("content"), max_chars=400)
+            if last_tool_call is None:
+                tool_calls = _extract_tool_call_names(msg.get("content"))
+                if tool_calls:
+                    last_tool_call = ToolCallEvent(ts=ts, tool_names=tool_calls)
             model = msg.get("model")
             provider = msg.get("provider")
             last_assistant = TailMessage(
@@ -349,6 +406,8 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
         last_assistant=last_assistant,
         last_assistant_thinking=last_assistant_thinking,
         last_tool_error=last_tool_error,
+        last_tool_result=last_tool_result,
+        last_tool_call=last_tool_call,
         last_compaction_at=last_compaction_at,
         last_entry_type=last_entry_type,
         last_entry_ts=last_entry_ts,
