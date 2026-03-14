@@ -106,3 +106,35 @@ clawmonitor tui
 ClawMonitor 继续坚持一个原则：**不做“全平台监控大而全”，只做“排障最关键的那两条线索 + 可解释的状态”。**
 
 如果你最近也在经历“队列空闲但我心不空闲”，希望这次更新能让你少走几圈排障回环。  
+
+---
+
+## 获取与安装（Git / PyPI / ClawHub Skill）
+
+项目地址（GitHub）：
+
+- `https://github.com/openclawq/clawmonitor`
+
+### 方式 1：PyPI（推荐）
+
+```bash
+pip install -U clawmonitor
+clawmonitor init
+clawmonitor tui
+```
+
+### 方式 2：Git 安装（适合想改代码/提 PR）
+
+```bash
+git clone https://github.com/openclawq/clawmonitor
+cd clawmonitor
+python3 -m pip install -e .
+clawmonitor tui
+```
+
+### 方式 3：ClawHub Skill（OpenClaw 生态）
+
+如果你在 ClawHub 里通过 “Import from GitHub” 导入该 repo，会自动识别 `skills/claw-monitor/SKILL.md`。
+更详细说明见仓库内：
+
+- `docs/clawhub-skill.md`
