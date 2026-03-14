@@ -1028,7 +1028,9 @@ class ClawMonitorTUI:
         if maxw <= 0:
             return
         text = _sanitize_for_curses(text)
-        text = _truncate_cells(text, maxw)
+        # Always pad to the target width so shorter redraws don't leave stale
+        # characters on screen (common with dynamic status/details lines).
+        text = _pad_right_cells(text, maxw)
         try:
             if attr:
                 stdscr.addnstr(y, x, text, maxw, attr)
