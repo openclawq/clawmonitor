@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+
+- TUI: Focus filter (`x`) to hide stale/noise sessions; footer shows `sessions=shown/total`.
+- TUI: rename/label editor (`R`) writes `[labels]` back to your config for opaque ids (e.g. Feishu `ou_...`, Telegram chat ids).
+- Cron: `clawmonitor cron` + cron jobs in tree view (toggle `c`).
+- Display: show agent identity name from `IDENTITY.md` as `name(agentId)`; compact list columns; clearer related logs header.
+- UX: default NODE label mode off (`n` toggle); expanded `?` help for states/flags.
+
 ## 0.1.5
 
 - TUI: startup loading splash (customizable via `docs/loadingart.txt` or `$CLAWMONITOR_LOADING_ART`).
