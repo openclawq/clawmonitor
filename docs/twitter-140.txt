@@ -1,0 +1,1 @@
+ClawMonitor v0.1.6: OpenClaw session monitor (TUI/CLI) — Focus filter, in-TUI rename/labels for opaque IDs, cron job view, clearer flags/logs. pip-only: `pip install clawmonitor`. #OpenClaw
