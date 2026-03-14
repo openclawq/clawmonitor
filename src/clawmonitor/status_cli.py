@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import time
 
 from .channels_status import fetch_channels_status
+from .channels_status import ChannelsSnapshot
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
@@ -57,6 +58,53 @@ def _fmt_age(age: Optional[int]) -> str:
     return f"{age//3600}h"
 
 
+def _channel_account_info(
+    channels: Optional[ChannelsSnapshot],
+    *,
+    channel: Optional[str],
+    account_id: Optional[str],
+) -> Optional[Dict[str, object]]:
+    if not channels or not channel:
+        return None
+    chan = (channel or "").strip()
+    if not chan:
+        return None
+    acct = (account_id or "").strip() or (channels.raw.get("channelDefaultAccountId", {}) or {}).get(chan) or "default"
+    try:
+        accounts = (channels.raw.get("channelAccounts", {}) or {}).get(chan)
+        if isinstance(accounts, list):
+            for ent in accounts:
+                if not isinstance(ent, dict):
+                    continue
+                if str(ent.get("accountId") or "") == str(acct):
+                    return ent
+    except Exception:
+        return None
+    return None
+
+
+def _internal_activity_at(tail: Any) -> Optional[datetime]:
+    candidates: List[datetime] = []
+    try:
+        if tail.last_assistant and tail.last_assistant.ts:
+            candidates.append(tail.last_assistant.ts)
+    except Exception:
+        pass
+    try:
+        if tail.last_tool_error and tail.last_tool_error[0]:
+            candidates.append(tail.last_tool_error[0])
+    except Exception:
+        pass
+    try:
+        if tail.last_entry_type and tail.last_entry_type != "message" and tail.last_entry_ts:
+            candidates.append(tail.last_entry_ts)
+    except Exception:
+        pass
+    if not candidates:
+        return None
+    return max(candidates)
+
+
 @dataclass(frozen=True)
 class StatusRow:
     agent_id: str
@@ -76,6 +124,10 @@ class StatusRow:
     last_assistant_at: str
     user_age: str
     assistant_age: str
+    human_out_at: str
+    human_out_age: str
+    internal_at: str
+    internal_age: str
     run_for: str
     task_preview: str
     last_user_preview: str
@@ -173,6 +225,10 @@ def collect_status(
         updated_dt = _dt_from_ms(meta.updated_at_ms)
         transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
 
+        acct_info = _channel_account_info(channels, channel=meta.channel, account_id=meta.account_id)
+        out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info, dict) and isinstance(acct_info.get("lastOutboundAt"), int) else None)
+        internal_at = _internal_activity_at(tail)
+
         task_preview = "-"
         if computed.state == WorkState.WORKING:
             src = tail.last_user_send or tail.last_trigger
@@ -218,6 +274,10 @@ def collect_status(
                 last_assistant_at=_fmt_dt(tail.last_assistant.ts if tail.last_assistant else None),
                 user_age=_fmt_age(_age_seconds(user_msg.ts if user_msg else None)),
                 assistant_age=_fmt_age(_age_seconds(tail.last_assistant.ts if tail.last_assistant else None)),
+                human_out_at=_fmt_dt(out_at),
+                human_out_age=_fmt_age(_age_seconds(out_at)),
+                internal_at=_fmt_dt(internal_at),
+                internal_age=_fmt_age(_age_seconds(internal_at)),
                 run_for=run_for,
                 task_preview=task_preview[:120] if task_preview else "-",
                 last_user_preview=user_preview[:120] if user_preview else "-",
@@ -268,7 +328,20 @@ def format_table(rows: List[StatusRow], limit: Optional[int] = None, *, detail: 
 
 def format_markdown(rows: List[StatusRow], limit: Optional[int] = None, *, detail: bool = False) -> str:
     shown = rows[:limit] if limit else rows
-    header = ["agentId", "channel", "state", "updatedAge", "userAge", "assistantAge", "runFor", "flags", "sessionKey", "reason"]
+    header = [
+        "agentId",
+        "channel",
+        "state",
+        "updatedAge",
+        "userAge",
+        "assistantAge",
+        "outAgeHuman",
+        "thinkAge",
+        "runFor",
+        "flags",
+        "sessionKey",
+        "reason",
+    ]
     if detail:
         header = header[:-2] + ["taskPreview", "lastUserPreview", "lastAssistantPreview"] + header[-2:]
     lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
@@ -283,6 +356,8 @@ def format_markdown(rows: List[StatusRow], limit: Optional[int] = None, *, detai
             esc(r.updated_age),
             esc(r.user_age),
             esc(r.assistant_age),
+            esc(r.human_out_age),
+            esc(r.internal_age),
             esc(r.run_for),
             esc(",".join(r.flags) if r.flags else "-"),
         ]
@@ -314,6 +389,10 @@ def format_json(rows: List[StatusRow], openclaw_root: Path) -> str:
                 "lastUserAt": r.last_user_at,
                 "lastAssistantAt": r.last_assistant_at,
                 "lastEntryType": r.last_entry_type,
+                "humanOutAt": r.human_out_at,
+                "humanOutAge": r.human_out_age,
+                "thinkAt": r.internal_at,
+                "thinkAge": r.internal_age,
                 "assistantModel": r.assistant_model,
                 "assistantProvider": r.assistant_provider,
                 "acpState": r.acp_state,

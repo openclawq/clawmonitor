@@ -8,6 +8,7 @@ This document explains the “why” and “how” behind ClawMonitor’s respon
   1) What is the last inbound user message + timestamp?
   2) What is the current work state (working/finished/interrupted/no message), and why?
 - **Long-task friendly**: a task can run for 1 hour; the monitor should show “still running” without waiting for a 1-hour heartbeat.
+- **Expose “silent gaps”**: distinguish “agent is active” vs “human-visible output is being delivered”.
 - **Gateway optional**: offline mode still works (sessions/transcripts/locks/delivery-queue).
 - **Actionability**: every monitor conclusion should be explainable by local files or Gateway logs.
 - **No secrets in repo**: config is local; runtime reports/logs go to XDG state dirs.
@@ -78,3 +79,20 @@ ClawMonitor prefers:
 2) configured agent name from `openclaw.json`
 
 and displays it as `name(agentId)` when it differs from the id.
+
+## “Silent gap” metrics (lightweight)
+
+Some of the nastiest failures happen in the gap between “agent is doing something” and “a human sees output”.
+ClawMonitor keeps this lightweight by tracking two *ages*:
+
+- `age_output` (human-visible): time since the IM channel last successfully sent an outbound message.
+  - Source: Gateway `channels.status` → `lastOutboundAt` (per channel account).
+  - Why: this is the cleanest signal for “a real message was delivered to a human”, but it is channel-level.
+- `age_think` (internal activity): time since the session last produced internal activity (even if nothing was delivered).
+  - Source: transcript tail timestamps (assistant message / toolResult / non-message entries).
+  - Why: if `age_think` is fresh but `age_output` is stale, the agent may be “working silently” (stuck behind delivery, policy gates, routing, or a loop).
+
+These are intentionally **heuristics**:
+
+- They do not require token accounting or deep parsing.
+- They are most useful when shown side-by-side (and in `d` diagnosis), not as a single “truthy” status.

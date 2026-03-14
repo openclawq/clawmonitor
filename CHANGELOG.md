@@ -1,8 +1,14 @@
 # Changelog
 
+## 0.1.8
+
+- Silent-gap metrics: show `outAgeHuman` (channel lastOutboundAt) vs `thinkAge` (internal transcript activity) to spot “working silently”.
+- TUI: `d` now runs on-demand diagnosis for the selected session (includes silent-gap hints) instead of forcing a full refresh.
+- Docs: explain the two ages and add Git/PyPI/ClawHub install section in the 0.1.6 WeChat post.
+
 ## 0.1.7
 
-- TUI: fix occasional “stale characters” artifacts on dynamic lines by padding redraws (prevents leftover fragments like `ounter(line`).
+- TUI: fix occasional “stale characters” artifacts on dynamic lines by padding redraws (prevents leftover fragments on screen).
 
 ## 0.1.6
 

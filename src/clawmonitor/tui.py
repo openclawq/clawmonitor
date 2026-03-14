@@ -57,7 +57,7 @@ from .acpx_sessions import AcpxSnapshot, acpx_is_working, acpx_session_path, loa
 from .channels_status import ChannelsSnapshot, fetch_channels_status
 from .config import Config
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
-from .diagnostics import Finding, diagnose, related_logs
+from .diagnostics import Evidence, Finding, diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .config import write_labels
@@ -317,6 +317,34 @@ def _channel_account_info(
     return None
 
 
+def _internal_activity_at(tail: TranscriptTail) -> Optional[datetime]:
+    """
+    Best-effort "agent is doing something" timestamp.
+
+    Prefer assistant/tool activity. Avoid treating generic role=user wrapper
+    messages as activity; they can be control-plane injections.
+    """
+    candidates: List[datetime] = []
+    try:
+        if tail.last_assistant and tail.last_assistant.ts:
+            candidates.append(tail.last_assistant.ts)
+    except Exception:
+        pass
+    try:
+        if tail.last_tool_error and tail.last_tool_error[0]:
+            candidates.append(tail.last_tool_error[0])
+    except Exception:
+        pass
+    try:
+        if tail.last_entry_type and tail.last_entry_type != "message" and tail.last_entry_ts:
+            candidates.append(tail.last_entry_ts)
+    except Exception:
+        pass
+    if not candidates:
+        return None
+    return max(candidates)
+
+
 def _agent_markers(meta: SessionMeta, cfg_snapshot: Optional[OpenClawConfigSnapshot]) -> List[str]:
     markers: List[str] = []
     info = parse_session_key(meta.key)
@@ -381,6 +409,11 @@ class SessionView:
     transcript_missing: bool
     telegram_binding: Optional[TelegramThreadBinding]
     telegram_routed_elsewhere: bool
+    # Lightweight "silent gap" metrics:
+    # - human_out_at: last human-visible outbound send time (channel-level)
+    # - internal_activity_at: last internal activity timestamp from transcript tail (assistant/tool/non-message)
+    human_out_at: Optional[datetime]
+    internal_activity_at: Optional[datetime]
 
 
 class MonitorModel:
@@ -389,6 +422,7 @@ class MonitorModel:
         self.elog = elog
         self._sessions: List[SessionView] = []
         self._sessions_lock = threading.Lock()
+        self._findings_by_key: Dict[str, List[Finding]] = {}
         self._tail_cache: Dict[Path, Tuple[float, int, TranscriptTail]] = {}
         self._acpx_cache: Dict[Path, Tuple[float, int, Optional[AcpxSnapshot], TranscriptTail]] = {}
         self._tail_key_cache: Dict[str, Tuple[Optional[int], Optional[str], float, TranscriptTail]] = {}
@@ -435,6 +469,10 @@ class MonitorModel:
     def sessions(self) -> List[SessionView]:
         with self._sessions_lock:
             return list(self._sessions)
+
+    def set_findings(self, session_key: str, findings: List[Finding]) -> None:
+        with self._sessions_lock:
+            self._findings_by_key[session_key] = list(findings)
 
     def _refresh_delivery_map(self) -> None:
         now = time.time()
@@ -618,7 +656,8 @@ class MonitorModel:
                     created_at = acpx.last_prompt_at or acpx.last_used_at or acpx.updated_at or _dt_from_ms(meta.updated_at_ms)
                     working = WorkingSignal(kind="acp", created_at=created_at, pid=acpx.pid, pid_alive=None)
             computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok, working=working)
-            findings: List[Finding] = []
+            with self._sessions_lock:
+                findings = list(self._findings_by_key.get(meta.key, []))
             transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
             telegram_binding: Optional[TelegramThreadBinding] = None
             telegram_routed_elsewhere = False
@@ -626,6 +665,10 @@ class MonitorModel:
                 telegram_binding = self._telegram_binding_for(account_id=meta.account_id, to=meta.to)
                 if telegram_binding and telegram_binding.target_session_key and telegram_binding.target_session_key != meta.key:
                     telegram_routed_elsewhere = True
+
+            acct_info = _channel_account_info(self.channels, channel=meta.channel, account_id=meta.account_id)
+            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info, dict) and isinstance(acct_info.get("lastOutboundAt"), int) else None)
+            internal_at = _internal_activity_at(tail)
             views.append(
                 SessionView(
                     meta=meta,
@@ -640,6 +683,8 @@ class MonitorModel:
                     transcript_missing=transcript_missing,
                     telegram_binding=telegram_binding,
                     telegram_routed_elsewhere=telegram_routed_elsewhere,
+                    human_out_at=out_at,
+                    internal_activity_at=internal_at,
                 )
             )
         with self._sessions_lock:
@@ -1392,6 +1437,16 @@ class ClawMonitorTUI:
             in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
             out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
             status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
+        if sv.human_out_at:
+            status_lines.append(f"HumanOut: @ {_fmt_dt(sv.human_out_at)}  age={_fmt_age(_age_seconds(sv.human_out_at)).strip()}")
+        else:
+            status_lines.append("HumanOut: -")
+        if sv.internal_activity_at:
+            status_lines.append(
+                f"Internal: @ {_fmt_dt(sv.internal_activity_at)}  age={_fmt_age(_age_seconds(sv.internal_activity_at)).strip()}"
+            )
+        else:
+            status_lines.append("Internal: -")
         if sv.telegram_binding:
             b = sv.telegram_binding
             note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
@@ -1803,7 +1858,7 @@ class ClawMonitorTUI:
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
-            "  d              Re-run diagnosis (forces refresh)",
+            "  d              Diagnose selected session (includes silent-gap hints)",
             "",
             "States (STATE column):",
             "  WORKING        Task is running (lock present or ACPX indicates running).",
@@ -1897,6 +1952,88 @@ class ClawMonitorTUI:
         for fmt, path in paths.items():
             self.elog.write("report.written", sessionKey=sv.meta.key, format=fmt, path=str(path))
 
+    def _silent_gap_findings(self, sv: SessionView) -> List[Finding]:
+        """
+        Lightweight heuristics for "agent active but no human-visible output".
+
+        These findings are intentionally conservative and only meant to help
+        interpret the gap between transcript activity and channel delivery.
+        """
+        out_age = _age_seconds(sv.human_out_at)
+        internal_age = _age_seconds(sv.internal_activity_at)
+        if out_age is None:
+            return []
+        is_working = sv.computed.state == WorkState.WORKING
+        if not is_working:
+            return []
+
+        findings: List[Finding] = []
+        # Thresholds: keep simple and avoid noisy alerts.
+        # - if internal is fresh but human output is stale, suspect silent gap.
+        if internal_age is not None and out_age >= 10 * 60 and internal_age <= 2 * 60 and (out_age - internal_age) >= 5 * 60:
+            findings.append(
+                Finding(
+                    id="silent_output_gap",
+                    severity="warn",
+                    summary="Internal activity is recent, but human-visible outbound looks stale (possible silent loop, delivery, routing, or policy gate).",
+                    evidence=[
+                        Evidence(ts=None, text=f"HumanOut age={_fmt_age(out_age).strip()} last={_fmt_dt(sv.human_out_at)}"),
+                        Evidence(ts=None, text=f"Internal age={_fmt_age(internal_age).strip()} last={_fmt_dt(sv.internal_activity_at)}"),
+                    ],
+                    next_steps=[
+                        "Check `DELIVERY_FAILED` and the related logs panel for outbound errors.",
+                        "Compare transcript `lastAssistantAt` vs channel `lastOutboundAt` (delivery gap).",
+                        "If Telegram, verify thread bindings are not routing the chat elsewhere (BIND/BOUND_OTHER).",
+                    ],
+                )
+            )
+        # If both are stale but lock still present, suspect a stall/hang.
+        if out_age >= 10 * 60 and (internal_age is None or internal_age >= 10 * 60) and (sv.lock is not None or sv.working is not None):
+            findings.append(
+                Finding(
+                    id="possible_stall",
+                    severity="warn",
+                    summary="Session looks WORKING but there is no recent internal activity and no recent human-visible outbound.",
+                    evidence=[
+                        Evidence(ts=None, text=f"HumanOut age={_fmt_age(out_age).strip()} last={_fmt_dt(sv.human_out_at)}"),
+                        Evidence(ts=None, text=f"Internal age={_fmt_age(internal_age).strip() if internal_age is not None else '-'} last={_fmt_dt(sv.internal_activity_at)}"),
+                    ],
+                    next_steps=[
+                        "Inspect lock details (pid alive/createdAt) and consider restarting the agent/gateway if it is stuck.",
+                        "Open related logs and look for upstream/tool timeouts or repeated failures.",
+                    ],
+                )
+            )
+        return findings
+
+    def _diagnose_selected(self, sv: SessionView) -> None:
+        # Pull latest logs for better evidence (best-effort).
+        try:
+            self.model.gateway_log_tailer.poll(limit=200)
+        except Exception:
+            pass
+        findings = []
+        try:
+            findings.extend(self._silent_gap_findings(sv))
+        except Exception:
+            pass
+        try:
+            findings.extend(
+                diagnose(
+                    session_key=sv.meta.key,
+                    channel=sv.meta.channel,
+                    account_id=sv.meta.account_id,
+                    delivery_failed=sv.delivery_failure is not None,
+                    no_feedback=sv.computed.no_feedback,
+                    is_working=sv.computed.state.value == "WORKING",
+                    gateway_lines=self.model.gateway_log_tailer.lines,
+                )
+            )
+        except Exception:
+            pass
+        self.model.set_findings(sv.meta.key, findings)
+        sv.findings = findings
+
     def _main(self, stdscr: "curses._CursesWindow") -> None:
         curses.curs_set(0)
         try:
@@ -1969,9 +2106,9 @@ class ClawMonitorTUI:
                 self.show_logs = not self.show_logs
                 dirty = True
             elif ch == ord("d"):
-                # Diagnosis is recomputed each refresh; force refresh.
-                self.model.refresh()
-                self._last_refresh_at = time.time()
+                sv = self._selected_session(items)
+                if sv:
+                    self._diagnose_selected(sv)
                 dirty = True
             elif ch == ord("f"):
                 opts = [1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0]
