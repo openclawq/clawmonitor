@@ -62,6 +62,7 @@ from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .config import write_labels
 from .locks import LockInfo, lock_path_for_session_file, read_lock
+from .model_monitor import ModelProbeOptions, ModelRow, collect_model_rows
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
 from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
 from .labels import has_user_label, session_display_label
@@ -336,6 +337,11 @@ def _internal_activity_at(tail: TranscriptTail) -> Optional[datetime]:
     except Exception:
         pass
     try:
+        if tail.last_tool_result and tail.last_tool_result.ts:
+            candidates.append(tail.last_tool_result.ts)
+    except Exception:
+        pass
+    try:
         if tail.last_entry_type and tail.last_entry_type != "message" and tail.last_entry_ts:
             candidates.append(tail.last_entry_ts)
     except Exception:
@@ -414,6 +420,41 @@ class SessionView:
     # - internal_activity_at: last internal activity timestamp from transcript tail (assistant/tool/non-message)
     human_out_at: Optional[datetime]
     internal_activity_at: Optional[datetime]
+
+
+class ModelMonitorState:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._rows: List[ModelRow] = []
+        self._lock = threading.Lock()
+        self._last_options = ModelProbeOptions()
+
+    @property
+    def rows(self) -> List[ModelRow]:
+        with self._lock:
+            return list(self._rows)
+
+    @property
+    def last_options(self) -> ModelProbeOptions:
+        with self._lock:
+            return self._last_options
+
+    def refresh(
+        self,
+        *,
+        options: Optional[ModelProbeOptions] = None,
+        progress: Optional[Callable[[str, int, int], None]] = None,
+    ) -> None:
+        opts = options or self.last_options
+        rows = collect_model_rows(
+            openclaw_root=self.cfg.openclaw_root,
+            openclaw_bin=self.cfg.openclaw_bin,
+            options=opts,
+            progress=progress,
+        )
+        with self._lock:
+            self._rows = rows
+            self._last_options = opts
 
 
 class MonitorModel:
@@ -723,10 +764,15 @@ class ClawMonitorTUI:
         self.config_path = config_path
         self.elog = EventLog()
         self.model = MonitorModel(cfg, self.elog)
+        self.model_monitor = ModelMonitorState(cfg)
         self._loading_art_lines = _load_loading_art_lines()
+        self.view_mode = "sessions"
         self.selected = 0
         self.scroll = 0
         self.selected_session_key: Optional[str] = None
+        self.model_selected = 0
+        self.model_scroll = 0
+        self.selected_model_key: Optional[str] = None
         self.show_logs = True
         self.tree_view = True
         self.show_cron = True
@@ -749,6 +795,14 @@ class ClawMonitorTUI:
         self._refresh_progress_step: int = 0
         self._refresh_progress_total: int = 0
         self._refresh_error: Optional[str] = None
+        self._model_refresh_lock = threading.Lock()
+        self._model_refresh_in_progress = False
+        self._model_refresh_started_at: Optional[float] = None
+        self._model_refresh_progress_msg: str = ""
+        self._model_refresh_progress_step: int = 0
+        self._model_refresh_progress_total: int = 0
+        self._model_refresh_error: Optional[str] = None
+        self._model_last_refresh_at: Optional[float] = None
         self._rel_cache_session_key: Optional[str] = None
         self._rel_cache_log_count: int = -1
         self._rel_cache_lines: List[str] = []
@@ -791,6 +845,36 @@ class ClawMonitorTUI:
             self._refresh_progress_step = 0
             self._refresh_progress_total = 0
         t = threading.Thread(target=self._refresh_worker, name="clawmonitor-refresh", daemon=True)
+        t.start()
+
+    def _set_model_refresh_progress(self, msg: str, step: int, total: int) -> None:
+        with self._model_refresh_lock:
+            self._model_refresh_progress_msg = msg
+            self._model_refresh_progress_step = step
+            self._model_refresh_progress_total = total
+
+    def _model_refresh_worker(self) -> None:
+        try:
+            self.model_monitor.refresh(progress=self._set_model_refresh_progress)
+            err = None
+        except Exception as e:
+            err = str(e)
+        with self._model_refresh_lock:
+            self._model_refresh_in_progress = False
+            self._model_refresh_error = err
+            self._model_last_refresh_at = time.time()
+
+    def _request_model_refresh(self) -> None:
+        with self._model_refresh_lock:
+            if self._model_refresh_in_progress:
+                return
+            self._model_refresh_in_progress = True
+            self._model_refresh_started_at = time.time()
+            self._model_refresh_error = None
+            self._model_refresh_progress_msg = "Refreshing model probes..."
+            self._model_refresh_progress_step = 0
+            self._model_refresh_progress_total = 0
+        t = threading.Thread(target=self._model_refresh_worker, name="clawmonitor-model-refresh", daemon=True)
         t.start()
 
     def _related_logs_cached(self, sv: SessionView) -> Tuple[List[str], Optional[str]]:
@@ -1038,6 +1122,51 @@ class ClawMonitorTUI:
         if sv:
             self.selected_session_key = sv.meta.key
 
+    def _move_selection_to_edge(self, items: List[ListItem], *, end: bool) -> None:
+        if not items:
+            return
+        indexes = [i for i, item in enumerate(items) if self._is_selectable(item)]
+        if not indexes:
+            return
+        self.selected = indexes[-1] if end else indexes[0]
+        sv = self._selected_session(items)
+        if sv:
+            self.selected_session_key = sv.meta.key
+
+    def _model_key(self, row: ModelRow) -> str:
+        return f"{row.target.agent_id}:{row.target.model_ref}"
+
+    def _selected_model(self, rows: List[ModelRow]) -> Optional[ModelRow]:
+        if not rows or self.model_selected < 0 or self.model_selected >= len(rows):
+            return None
+        return rows[self.model_selected]
+
+    def _reconcile_model_selection(self, rows: List[ModelRow]) -> None:
+        if not rows:
+            self.model_selected = 0
+            self.model_scroll = 0
+            self.selected_model_key = None
+            return
+        if self.selected_model_key:
+            for idx, row in enumerate(rows):
+                if self._model_key(row) == self.selected_model_key:
+                    self.model_selected = idx
+                    return
+        self.model_selected = min(max(0, self.model_selected), len(rows) - 1)
+        self.selected_model_key = self._model_key(rows[self.model_selected])
+
+    def _move_model_selection(self, rows: List[ModelRow], delta: int) -> None:
+        if not rows:
+            return
+        self.model_selected = max(0, min(len(rows) - 1, self.model_selected + delta))
+        self.selected_model_key = self._model_key(rows[self.model_selected])
+
+    def _move_model_to_edge(self, rows: List[ModelRow], *, end: bool) -> None:
+        if not rows:
+            return
+        self.model_selected = len(rows) - 1 if end else 0
+        self.selected_model_key = self._model_key(rows[self.model_selected])
+
     def _row_attr(self, health_cls: str, *, selected: bool) -> int:
         attr = curses.A_NORMAL
         if self._colors_enabled:
@@ -1136,7 +1265,11 @@ class ClawMonitorTUI:
     def _draw_header(self, stdscr: "curses._CursesWindow", width: int) -> None:
         channels = self.model.channels
         mode = "online" if self.model.gateway_log_tailer.available else "offline"
-        head = f"ClawMonitor  |  OpenClaw: {self.cfg.openclaw_root}  |  Gateway: {mode}  |  {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+        view = "Models" if self.view_mode == "models" else "Sessions"
+        head = (
+            f"ClawMonitor  |  View: {view}  |  OpenClaw: {self.cfg.openclaw_root}  |  "
+            f"Gateway: {mode}  |  {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         self._safe_addnstr(stdscr, 0, 0, head.ljust(width), width, curses.A_REVERSE)
         if channels and isinstance(channels.raw.get("channelOrder"), list):
             chan_names = ", ".join([str(x) for x in channels.raw.get("channelOrder", [])])
@@ -1144,6 +1277,37 @@ class ClawMonitorTUI:
         else:
             err = self.model.gateway_log_tailer.last_error
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
+
+    def _model_banner(self) -> Tuple[str, int]:
+        with self._model_refresh_lock:
+            in_prog = self._model_refresh_in_progress
+            started_at = self._model_refresh_started_at
+            prog_msg = self._model_refresh_progress_msg
+            prog_step = self._model_refresh_progress_step
+            prog_total = self._model_refresh_progress_total
+            err = self._model_refresh_error
+        rows = self.model_monitor.rows
+        elapsed = ""
+        if started_at is not None and in_prog:
+            elapsed = f" elapsed={int(max(0.0, time.time() - started_at))}s"
+        if in_prog:
+            state = "RUNNING"
+            msg = prog_msg or "Running probes..."
+            progress = f" {prog_step}/{prog_total}" if prog_total > 0 else ""
+            text = f"MODEL PROBE: {state}{progress}{elapsed}  {msg}"
+            attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+            return text, attr
+        if err:
+            text = f"MODEL PROBE: ERROR  {err}"
+            attr = curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+            return text, attr
+        if self._model_last_refresh_at is not None:
+            text = f"MODEL PROBE: DONE  rows={len(rows)}  lastRefresh={_fmt_age(int(time.time() - self._model_last_refresh_at))} ago"
+            attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+            return text, attr
+        text = "MODEL PROBE: WAITING  Press [r] to start probing configured models."
+        attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        return text, attr
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
         node_w = max(10, min(18, int(w * 0.20)))
@@ -1251,6 +1415,111 @@ class ClawMonitorTUI:
             )
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
+
+    def _model_health_class(self, row: ModelRow) -> str:
+        status = (row.overall_status or "").strip()
+        if status == "ok":
+            return "ok"
+        if status in ("degraded", "timeout", "rate_limit", "overloaded"):
+            return "working"
+        if status in ("unsupported", "unknown"):
+            return "idle"
+        return "alert"
+
+    def _probe_metric(self, probe: Optional[ModelRow | object]) -> str:
+        if probe is None:
+            return "-"
+        latency = getattr(probe, "latency_ms", None)
+        if latency is None:
+            return "-"
+        return f"{latency}ms"
+
+    def _draw_model_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, rows: List[ModelRow]) -> None:
+        model_w = max(18, min(30, int(w * 0.34)))
+        role_w = max(10, min(18, int(w * 0.16)))
+        state_w = 10
+        probe_w = 13
+        header = (
+            f"{_fit('STATE', state_w)}  {_fit('AGENT', 14)}  {_fit('MODEL', model_w)}  "
+            f"{_fit('ROLES', role_w)}  {_fit('DIRECT', probe_w)}  {_fit('CLAW', probe_w)}"
+        )
+        self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
+        body_y = y + 1
+        visible = max(0, h - 1)
+        if self.model_selected < self.model_scroll:
+            self.model_scroll = self.model_selected
+        if self.model_selected >= self.model_scroll + visible:
+            self.model_scroll = self.model_selected - visible + 1
+        for i in range(visible):
+            idx = self.model_scroll + i
+            row_y = body_y + i
+            if idx >= len(rows):
+                self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
+                continue
+            row = rows[idx]
+            line = (
+                f"{_fit(row.overall_status.upper(), state_w)}  "
+                f"{_fit(row.target.agent_label, 14)}  "
+                f"{_fit(row.target.model_ref, model_w)}  "
+                f"{_fit(','.join(row.target.roles), role_w)}  "
+                f"{_fit(self._probe_metric(row.direct), probe_w)}  "
+                f"{_fit(self._probe_metric(row.openclaw), probe_w)}"
+            )
+            attr = self._row_attr(self._model_health_class(row), selected=(idx == self.model_selected))
+            self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
+
+    def _draw_model_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, row: Optional[ModelRow]) -> None:
+        for j in range(h):
+            self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
+        if not row:
+            self._safe_addnstr(stdscr, y, x, "No model rows. Press [r] to probe configured models.", w)
+            return
+
+        lines: List[str] = [
+            f"Model: {row.target.model_ref}",
+            f"Label: {row.target.model_label or '-'}",
+            f"Agent: {row.target.agent_label} ({row.target.agent_id})",
+            f"Roles: {','.join(row.target.roles) or '-'}",
+            f"API: {row.target.api_kind or '-'}",
+            f"Base URL: {row.target.base_url or '-'}",
+            f"Auth Source: {row.target.auth_source or '-'}",
+            f"Overall: {row.overall_status.upper()}  Connection: {row.overall_connection}",
+            f"Summary: {row.summary}",
+            "",
+            "Direct Probe:",
+        ]
+        lines.extend(self._probe_lines(row.direct, width=w))
+        lines.append("")
+        lines.append("OpenClaw Probe:")
+        lines.extend(self._probe_lines(row.openclaw, width=w))
+
+        for i in range(min(h, len(lines))):
+            attr = 0
+            if lines[i] in ("Direct Probe:", "OpenClaw Probe:"):
+                attr = curses.A_BOLD
+            self._safe_addnstr(stdscr, y + i, x, _fit(lines[i], w), w, attr)
+
+    def _probe_lines(self, probe: Optional[object], *, width: int) -> List[str]:
+        if probe is None:
+            return ["  - disabled"]
+        status = getattr(probe, "status", "-")
+        checked_at = getattr(probe, "checked_at", None)
+        latency = getattr(probe, "latency_ms", None)
+        efficiency = getattr(probe, "efficiency", None)
+        efficiency_unit = getattr(probe, "efficiency_unit", None)
+        detail = getattr(probe, "detail", "")
+        reply_preview = getattr(probe, "reply_preview", "")
+        line1 = f"  status={status} checked={_fmt_dt(checked_at)} latency={latency if latency is not None else '-'}ms"
+        if latency is None:
+            line1 = f"  status={status} checked={_fmt_dt(checked_at)}"
+        lines = [line1]
+        if efficiency is not None and efficiency_unit:
+            lines.append(f"  efficiency={efficiency:.3f} {efficiency_unit}")
+        if detail:
+            lines.extend([f"  detail: {part}" for part in _wrap_lines(detail, max(8, width - 10), max_lines=3)])
+        if reply_preview:
+            lines.extend([f"  reply: {part}" for part in _wrap_lines(redact_text(reply_preview), max(8, width - 10), max_lines=3)])
+        return lines
 
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
         if not sv:
@@ -1415,6 +1684,13 @@ class ClawMonitorTUI:
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
+                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
+                status_lines.append(f"ToolCall: {names}")
+            if sv.tail.last_tool_result:
+                tr = sv.tail.last_tool_result
+                ok = "err" if tr.is_error else "ok"
+                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
             if sv.tail.last_tool_error:
                 ts, summary = sv.tail.last_tool_error
                 status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
@@ -1427,6 +1703,13 @@ class ClawMonitorTUI:
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
+                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
+                status_lines.append(f"ToolCall: {names}")
+            if sv.tail.last_tool_result:
+                tr = sv.tail.last_tool_result
+                ok = "err" if tr.is_error else "ok"
+                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
             if sv.tail.last_tool_error:
                 ts, summary = sv.tail.last_tool_error
                 status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
@@ -1473,11 +1756,31 @@ class ClawMonitorTUI:
         else:
             status_lines.append("Diagnosis: (none)")
 
-        for i in range(min(status_h - 1, len(status_lines))):
-            ln = status_lines[i]
+        max_status_lines = max(0, status_h - 1)
+        visible_status_lines = status_lines
+        if max_status_lines and len(status_lines) > max_status_lines:
+            # Keep the most important "header" lines, but always keep tail lines
+            # where alerts/diagnosis live (including Diagnosis: (none)).
+            head_n = min(5, max(1, max_status_lines - 3))
+            tail_n = max(1, max_status_lines - head_n - 1)
+            visible_status_lines = status_lines[:head_n] + ["…"] + status_lines[-tail_n:]
+
+        for i in range(min(max_status_lines, len(visible_status_lines))):
+            ln = visible_status_lines[i]
             attr = 0
-            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+            if ln.startswith(("Task:", "Thinking:", "Trigger:", "ToolCall:", "ToolResult:")):
                 attr = self._color_magenta if self._colors_enabled else 0
+            elif ln.startswith("Diagnosis:"):
+                if not self._colors_enabled:
+                    attr = curses.A_BOLD
+                else:
+                    low = ln.lower()
+                    if "(none)" in low:
+                        attr = curses.A_BOLD | self._color_ok
+                    elif "[info]" in low:
+                        attr = curses.A_BOLD | self._color_idle
+                    else:
+                        attr = curses.A_BOLD | self._color_alert
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         if msg_h <= 2:
@@ -1845,9 +2148,12 @@ class ClawMonitorTUI:
             "",
             "Navigation:",
             "  ↑/↓ (or k/j)   Select session",
+            "  PgUp/PgDn      Page up / down",
+            "  g / G          Jump to top / bottom",
             "  q or Esc       Quit",
             "",
             "Actions:",
+            "  v              Toggle session/model view",
             "  r              Refresh now",
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
@@ -1859,6 +2165,12 @@ class ClawMonitorTUI:
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
             "  d              Diagnose selected session (includes silent-gap hints)",
+            "",
+            "Model view:",
+            "  - Manual refresh only. Press [r] to run model probes.",
+            "  - Banner shows WAITING / RUNNING / DONE / ERROR for the current probe state.",
+            "  - Each row combines direct provider probing and probing through OpenClaw.",
+            "  - DIRECT / CLAW columns show the last probe latency when available.",
             "",
             "States (STATE column):",
             "  WORKING        Task is running (lock present or ACPX indicates running).",
@@ -2064,11 +2376,12 @@ class ClawMonitorTUI:
         self.model.refresh(progress=lambda m, i, t: self._draw_loading(stdscr, msg=m, step=i, total_steps=t, started_at=started_at))
         last_refresh = time.time()
         self._last_refresh_at = last_refresh
+        last_refresh_sig: Optional[Tuple[object, ...]] = None
         dirty = True
         while True:
             now = time.time()
             # Async refresh: keep UI responsive even if Gateway calls are slow.
-            if self._last_refresh_at is None or (now - self._last_refresh_at >= self.refresh_seconds):
+            if self.view_mode == "sessions" and (self._last_refresh_at is None or (now - self._last_refresh_at >= self.refresh_seconds)):
                 with self._refresh_lock:
                     in_prog = self._refresh_in_progress
                 if not in_prog:
@@ -2079,6 +2392,30 @@ class ClawMonitorTUI:
             sessions = self._apply_session_filter(sessions_all)
             items = self._build_list_items(sessions)
             self._reconcile_selection(items)
+            model_rows = self.model_monitor.rows
+            self._reconcile_model_selection(model_rows)
+            with self._refresh_lock:
+                session_sig = (
+                    self._refresh_in_progress,
+                    self._refresh_progress_msg,
+                    self._refresh_progress_step,
+                    self._refresh_progress_total,
+                    self._refresh_error,
+                    self._last_refresh_at,
+                )
+            with self._model_refresh_lock:
+                model_sig = (
+                    self._model_refresh_in_progress,
+                    self._model_refresh_progress_msg,
+                    self._model_refresh_progress_step,
+                    self._model_refresh_progress_total,
+                    self._model_refresh_error,
+                    self._model_last_refresh_at,
+                )
+            refresh_sig = (self.view_mode, session_sig, model_sig)
+            if refresh_sig != last_refresh_sig:
+                dirty = True
+                last_refresh_sig = refresh_sig
 
             try:
                 ch = stdscr.getch()
@@ -2090,22 +2427,60 @@ class ClawMonitorTUI:
                     pass
                 else:
                     continue
+            h, _ = stdscr.getmaxyx()
+            page_step = max(1, h - 6)
             if ch in (ord("q"), 27):
                 return
             if ch in (curses.KEY_UP, ord("k")):
-                self._move_selection(items, -1)
+                if self.view_mode == "models":
+                    self._move_model_selection(model_rows, -1)
+                else:
+                    self._move_selection(items, -1)
                 dirty = True
             elif ch in (curses.KEY_DOWN, ord("j")):
-                self._move_selection(items, 1)
+                if self.view_mode == "models":
+                    self._move_model_selection(model_rows, 1)
+                else:
+                    self._move_selection(items, 1)
+                dirty = True
+            elif ch in (curses.KEY_PPAGE,):
+                if self.view_mode == "models":
+                    self._move_model_selection(model_rows, -page_step)
+                else:
+                    self._move_selection(items, -page_step)
+                dirty = True
+            elif ch in (curses.KEY_NPAGE, ord(" ")):
+                if self.view_mode == "models":
+                    self._move_model_selection(model_rows, page_step)
+                else:
+                    self._move_selection(items, page_step)
+                dirty = True
+            elif ch in (curses.KEY_HOME, ord("g")):
+                if self.view_mode == "models":
+                    self._move_model_to_edge(model_rows, end=False)
+                else:
+                    self._move_selection_to_edge(items, end=False)
+                dirty = True
+            elif ch in (curses.KEY_END, ord("G")):
+                if self.view_mode == "models":
+                    self._move_model_to_edge(model_rows, end=True)
+                else:
+                    self._move_selection_to_edge(items, end=True)
+                dirty = True
+            elif ch == ord("v"):
+                self.view_mode = "models" if self.view_mode == "sessions" else "sessions"
                 dirty = True
             elif ch == ord("r"):
-                self._request_refresh()
-                last_refresh = time.time()
+                if self.view_mode == "models":
+                    self._request_model_refresh()
+                else:
+                    self._request_refresh()
+                    last_refresh = time.time()
                 dirty = True
-            elif ch == ord("l"):
+            elif ch == ord("l") and self.view_mode == "sessions":
                 self.show_logs = not self.show_logs
                 dirty = True
-            elif ch == ord("d"):
+            elif ch == ord("d") and self.view_mode == "sessions":
                 sv = self._selected_session(items)
                 if sv:
                     self._diagnose_selected(sv)
@@ -2119,22 +2494,22 @@ class ClawMonitorTUI:
                     i = 2
                 self.refresh_seconds = opts[(i + 1) % len(opts)]
                 dirty = True
-            elif ch == ord("t"):
+            elif ch == ord("t") and self.view_mode == "sessions":
                 self.tree_view = not self.tree_view
                 self.scroll = 0
                 dirty = True
-            elif ch == ord("c"):
+            elif ch == ord("c") and self.view_mode == "sessions":
                 self.show_cron = not self.show_cron
                 self.scroll = 0
                 dirty = True
-            elif ch == ord("n"):
+            elif ch == ord("n") and self.view_mode == "sessions":
                 self.node_show_session_label = not self.node_show_session_label
                 dirty = True
-            elif ch == ord("x"):
+            elif ch == ord("x") and self.view_mode == "sessions":
                 self.focus_mode = not self.focus_mode
                 self.scroll = 0
                 dirty = True
-            elif ch == ord("R"):
+            elif ch == ord("R") and self.view_mode == "sessions":
                 sv = self._selected_session(items)
                 if sv:
                     self._rename_selected(stdscr, sv)
@@ -2143,24 +2518,25 @@ class ClawMonitorTUI:
                 self._help_overlay(stdscr)
                 dirty = True
             elif ch in (ord("e"), 10, 13):
-                sv = self._selected_session(items)
-                if ch == ord("e") and sv:
-                    self._export_report(sv)
-                    dirty = True
-                elif ch in (10, 13) and sv:
-                    tmpl = self._template_picker(stdscr)
-                    if tmpl:
-                        self.elog.write("nudge.sent", sessionKey=sv.meta.key, template=tmpl)
-                        res = send_nudge(self.cfg.openclaw_bin, sv.meta.key, tmpl, deliver=True)
-                        self.elog.write(
-                            "nudge.result",
-                            sessionKey=sv.meta.key,
-                            ok=res.ok,
-                            runId=res.run_id or "",
-                            status=res.status or "",
-                            error=res.error or "",
-                        )
-                    dirty = True
+                if self.view_mode == "sessions":
+                    sv = self._selected_session(items)
+                    if ch == ord("e") and sv:
+                        self._export_report(sv)
+                        dirty = True
+                    elif ch in (10, 13) and sv:
+                        tmpl = self._template_picker(stdscr)
+                        if tmpl:
+                            self.elog.write("nudge.sent", sessionKey=sv.meta.key, template=tmpl)
+                            res = send_nudge(self.cfg.openclaw_bin, sv.meta.key, tmpl, deliver=True)
+                            self.elog.write(
+                                "nudge.result",
+                                sessionKey=sv.meta.key,
+                                ok=res.ok,
+                                runId=res.run_id or "",
+                                status=res.status or "",
+                                error=res.error or "",
+                            )
+                        dirty = True
 
             if not dirty:
                 continue
@@ -2170,48 +2546,87 @@ class ClawMonitorTUI:
             sessions = self._apply_session_filter(sessions_all)
             items = self._build_list_items(sessions)
             self._reconcile_selection(items)
+            model_rows = self.model_monitor.rows
+            self._reconcile_model_selection(model_rows)
 
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             self._draw_header(stdscr, w)
 
+            content_y = 2
             list_h = h - 3
+            if self.view_mode == "models":
+                banner, banner_attr = self._model_banner()
+                self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
+                content_y = 3
+                list_h = h - 4
             list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
             detail_w = w - list_w - 1
-            self._draw_list(stdscr, y=2, h=list_h, w=list_w, items=items)
-            sv = self._selected_session(items)
-            if detail_w >= 24 and list_w < w - 1:
-                try:
-                    stdscr.vline(2, list_w, curses.ACS_VLINE, max(0, h - 3))
-                except curses.error:
-                    pass
-                self._draw_details(stdscr, x=list_w + 1, y=2, h=h - 3, w=detail_w, sv=sv)
+            if self.view_mode == "models":
+                self._draw_model_list(stdscr, y=content_y, h=list_h, w=list_w, rows=model_rows)
+                model_row = self._selected_model(model_rows)
+                if detail_w >= 24 and list_w < w - 1:
+                    try:
+                        stdscr.vline(content_y, list_w, curses.ACS_VLINE, max(0, h - content_y - 1))
+                    except curses.error:
+                        pass
+                    self._draw_model_details(stdscr, x=list_w + 1, y=content_y, h=h - content_y - 1, w=detail_w, row=model_row)
+                else:
+                    self._safe_addnstr(
+                        stdscr,
+                        h - 2,
+                        0,
+                        "Terminal too narrow for model details. Widen window or use `clawmonitor models`.".ljust(w),
+                        w,
+                    )
+                sv = None
             else:
-                self._safe_addnstr(
-                    stdscr,
-                    h - 2,
-                    0,
-                    "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
-                    w,
-                )
+                self._draw_list(stdscr, y=content_y, h=list_h, w=list_w, items=items)
+                sv = self._selected_session(items)
+                if detail_w >= 24 and list_w < w - 1:
+                    try:
+                        stdscr.vline(content_y, list_w, curses.ACS_VLINE, max(0, h - content_y - 1))
+                    except curses.error:
+                        pass
+                    self._draw_details(stdscr, x=list_w + 1, y=content_y, h=h - content_y - 1, w=detail_w, sv=sv)
+                else:
+                    self._safe_addnstr(
+                        stdscr,
+                        h - 2,
+                        0,
+                        "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
+                        w,
+                    )
 
             refresh_age = "-"
-            if self._last_refresh_at is not None:
-                refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
-            with self._refresh_lock:
-                in_prog = self._refresh_in_progress
-                prog_msg = self._refresh_progress_msg
-                prog_step = self._refresh_progress_step
-                prog_total = self._refresh_progress_total
-                err = self._refresh_error
-            selectable = [it for it in items if isinstance(it, _ListSession)]
-            sel_total = len(selectable)
-            sel_pos = 0
-            if sv and sel_total:
-                try:
-                    sel_pos = 1 + [x.sv.meta.key for x in selectable].index(sv.meta.key)
-                except ValueError:
-                    sel_pos = 0
+            if self.view_mode == "models":
+                if self._model_last_refresh_at is not None:
+                    refresh_age = _fmt_age(int(time.time() - self._model_last_refresh_at))
+                with self._model_refresh_lock:
+                    in_prog = self._model_refresh_in_progress
+                    prog_msg = self._model_refresh_progress_msg
+                    prog_step = self._model_refresh_progress_step
+                    prog_total = self._model_refresh_progress_total
+                    err = self._model_refresh_error
+                sel_total = len(model_rows)
+                sel_pos = self.model_selected + 1 if model_rows else 0
+            else:
+                if self._last_refresh_at is not None:
+                    refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
+                with self._refresh_lock:
+                    in_prog = self._refresh_in_progress
+                    prog_msg = self._refresh_progress_msg
+                    prog_step = self._refresh_progress_step
+                    prog_total = self._refresh_progress_total
+                    err = self._refresh_error
+                selectable = [it for it in items if isinstance(it, _ListSession)]
+                sel_total = len(selectable)
+                sel_pos = 0
+                if sv and sel_total:
+                    try:
+                        sel_pos = 1 + [x.sv.meta.key for x in selectable].index(sv.meta.key)
+                    except ValueError:
+                        sel_pos = 0
             refresh_note = ""
             if in_prog:
                 if prog_total > 0:
@@ -2223,12 +2638,23 @@ class ClawMonitorTUI:
             elif err:
                 refresh_note = f" refreshErr={err[:40]}"
             footer = (
-                f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
-                f"[x]{'focus' if self.focus_mode else 'all'} "
-                f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
-                f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} "
-                f"sessions={self._last_shown_sessions}/{self._last_total_sessions} lastRefresh={refresh_age}{refresh_note}"
+                f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]refresh "
+                + (
+                    (
+                        f"[f]interval={int(self.refresh_seconds)}s "
+                        f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                        f"[x]{'focus' if self.focus_mode else 'all'} "
+                        f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
+                        f"[R]rename [Enter]nudge [e]export [l]logs  "
+                        f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
+                        f"lastRefresh={refresh_age}{refresh_note}"
+                    )
+                    if self.view_mode == "sessions"
+                    else (
+                        f"manual-model-probe sel={sel_pos}/{sel_total} "
+                        f"rows={len(model_rows)} lastRefresh={refresh_age}{refresh_note}"
+                    )
+                )
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .transcript_tail import TailMessage, TranscriptTail
+from .transcript_tail import TailMessage, ToolCallEvent, ToolResultEvent, TranscriptTail
 
 
 def _parse_iso(ts: Any) -> Optional[datetime]:
@@ -121,6 +121,8 @@ def tail_acpx_messages(doc: Dict[str, Any], *, max_preview_chars: int = 400) -> 
     last_assistant: Optional[TailMessage] = None
     last_assistant_thinking: Optional[str] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
+    last_tool_result: Optional[ToolResultEvent] = None
+    last_tool_call: Optional[ToolCallEvent] = None
 
     # ACPX messages usually do not include per-message timestamps; keep ts=None.
     for msg in reversed(list(_iter_acpx_messages(doc))[-400:]):
@@ -148,6 +150,7 @@ def tail_acpx_messages(doc: Dict[str, Any], *, max_preview_chars: int = 400) -> 
                 continue
             text_parts: list[str] = []
             think_parts: list[str] = []
+            tool_calls: list[str] = []
             for item in content:
                 if not isinstance(item, dict):
                     continue
@@ -155,23 +158,43 @@ def tail_acpx_messages(doc: Dict[str, Any], *, max_preview_chars: int = 400) -> 
                     th = item["Thinking"]
                     if isinstance(th, dict) and isinstance(th.get("text"), str) and th.get("text", "").strip():
                         think_parts.append(th.get("text", "").strip())
+                if "ToolCall" in item:
+                    tc = item.get("ToolCall")
+                    if isinstance(tc, dict):
+                        nm = tc.get("name")
+                        if isinstance(nm, str) and nm.strip() and nm.strip() not in tool_calls:
+                            tool_calls.append(nm.strip())
                 if "Text" in item and isinstance(item["Text"], str) and item["Text"].strip():
                     text_parts.append(item["Text"].strip())
-                if last_tool_error is None and "ToolResult" in item:
+                if "ToolResult" in item:
                     tr = item.get("ToolResult")
-                    if isinstance(tr, dict) and bool(tr.get("is_error", False)):
+                    if isinstance(tr, dict):
+                        is_error = bool(tr.get("is_error", False))
+                        nm = tr.get("tool_name") or tr.get("name") or tr.get("toolName")
+                        tool_name = str(nm).strip() if isinstance(nm, str) and nm.strip() else "tool"
                         content2 = tr.get("content")
                         preview = ""
                         if isinstance(content2, dict) and isinstance(content2.get("Text"), str):
                             preview = content2.get("Text", "")
                         elif isinstance(content2, str):
                             preview = content2
-                        last_tool_error = (None, f"tool error: {preview[:160]}".strip())
+                        if last_tool_result is None:
+                            last_tool_result = ToolResultEvent(
+                                ts=None,
+                                tool_name=tool_name,
+                                is_error=is_error,
+                                preview=(preview or "")[:240],
+                                tool_call_id=None,
+                            )
+                        if is_error and last_tool_error is None:
+                            last_tool_error = (None, f"{tool_name} error: {(preview or '')[:160]}".strip())
 
             preview = " ".join(text_parts).strip() or "<no text>"
             last_assistant = TailMessage(role="assistant", ts=None, preview=preview[:max_preview_chars], stop_reason=None)
             joined_think = " ".join(think_parts).strip()
             last_assistant_thinking = joined_think[:max_preview_chars] if joined_think else None
+            if tool_calls and last_tool_call is None:
+                last_tool_call = ToolCallEvent(ts=None, tool_names=tool_calls[:6])
             continue
 
         if last_user_send and last_assistant:
@@ -184,6 +207,7 @@ def tail_acpx_messages(doc: Dict[str, Any], *, max_preview_chars: int = 400) -> 
         last_assistant=last_assistant,
         last_assistant_thinking=last_assistant_thinking,
         last_tool_error=last_tool_error,
+        last_tool_result=last_tool_result,
+        last_tool_call=last_tool_call,
         last_compaction_at=None,
     )
-

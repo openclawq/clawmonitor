@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmonitor"
-version = "0.1.8"
-description = "Real-time OpenClaw session monitor (TUI) with Gateway log correlation and manual progress nudges."
+version = "0.1.9"
+description = "OpenClaw session and model monitor (TUI/CLI) with Gateway correlation and manual progress nudges."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -43,3 +43,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "clawmonitor.assets" = ["*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

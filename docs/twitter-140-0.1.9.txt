@@ -1,0 +1,1 @@
+ClawMonitor v0.1.9: OpenClaw now has model monitoring. Probe each configured model directly and through OpenClaw, classify timeout/auth/billing/rate-limit issues, switch TUI with `v`, run probes with `r`, and page with `PgUp/PgDn` or `g/G`. `pip install -U clawmonitor`

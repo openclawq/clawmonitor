@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.9
+
+- Model monitor: add `clawmonitor models` to probe configured models directly and/or through OpenClaw.
+- TUI: add separate `Models` view (`v` toggle) with manual refresh for per-model health checks.
+- TUI: model view now shows a prominent `WAITING` / `RUNNING` / `DONE` / `ERROR` banner during probe runs.
+- TUI: add `PgUp` / `PgDn` and `g` / `G` for page navigation / jump-to-edge.
+- Direct probes: auto-detect supported transports (`openai-completions`, `openai-responses`, `anthropic-messages`), resolve agent auth profiles, measure latency, and classify failures (`timeout`, `network`, `auth`, `billing`, `rate_limit`, `overloaded`, `unsupported`, `error`).
+- OpenClaw probes: run temporary probe sessions via `sessions.patch` + `agent` + `agent.wait`, then clean them up.
+- Tests/docs: add model monitor tests and a dedicated `docs/model-monitor.md`.
+
 ## 0.1.8
 
 - Silent-gap metrics: show `outAgeHuman` (channel lastOutboundAt) vs `thinkAge` (internal transcript activity) to spot “working silently”.

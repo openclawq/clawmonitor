@@ -13,6 +13,7 @@ from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .init_wizard import maybe_run_first_time_init, run_init
 from .locks import lock_path_for_session_file, read_lock
+from .model_monitor import ModelProbeOptions, collect_model_rows, format_model_json, format_model_markdown, format_model_table
 from .openclaw_config import read_openclaw_config_snapshot
 from .push_notify import push_message
 from .redact import redact_text
@@ -161,6 +162,31 @@ def cmd_cron(args: argparse.Namespace) -> int:
         print(format_cron_markdown(rows))
     else:
         print(format_cron_table(rows))
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    include_direct = args.mode in ("both", "direct")
+    include_openclaw = args.mode in ("both", "openclaw")
+    options = ModelProbeOptions(
+        prompt=args.prompt,
+        timeout_seconds=int(args.timeout),
+        include_direct=include_direct,
+        include_openclaw=include_openclaw,
+        max_workers=int(args.max_workers),
+    )
+    rows = collect_model_rows(
+        openclaw_root=cfg.openclaw_root,
+        openclaw_bin=cfg.openclaw_bin,
+        options=options,
+    )
+    if args.format == "json":
+        print(format_model_json(rows, openclaw_root=cfg.openclaw_root, options=options))
+    elif args.format == "md":
+        print(format_model_markdown(rows))
+    else:
+        print(format_model_table(rows))
     return 0
 
 
@@ -377,6 +403,14 @@ def main() -> None:
     cron = sub.add_parser("cron", help="List configured cron jobs and last run status")
     cron.add_argument("--format", choices=["text", "json", "md"], default="text")
     cron.set_defaults(func=cmd_cron)
+
+    models = sub.add_parser("models", help="Probe configured models directly and/or through OpenClaw")
+    models.add_argument("--format", choices=["text", "json", "md"], default="text")
+    models.add_argument("--mode", choices=["both", "direct", "openclaw"], default="both")
+    models.add_argument("--timeout", type=int, default=20, help="Per-probe timeout seconds")
+    models.add_argument("--prompt", default="Reply with exactly OK.", help="Short probe prompt")
+    models.add_argument("--max-workers", type=int, default=4, help="Parallel probe workers")
+    models.set_defaults(func=cmd_models)
 
     tree = sub.add_parser("tree", help="Print a tree-ish view grouped by agent")
     tree.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")

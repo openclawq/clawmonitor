@@ -9,6 +9,7 @@
 用于 **OpenClaw** 的实时 Session/Thread 监控工具，核心能力：
 
 - 每个 Session 的最后一条 **user** / **assistant** 消息（预览 + 时间）
+- 每个模型的健康探测（直连 provider API + 走 OpenClaw 自身链路）
 - 工作状态：`WORKING` / `FINISHED` / `INTERRUPTED` / `NO_MESSAGE`（并标记 `NO_FEEDBACK`）
 - 通过 `*.jsonl.lock` 识别长任务运行中状态（即使 Gateway 掉线也能判断）
 - 可选：Gateway 的 `logs.tail` + `channels.status` 关联（偏 Feishu/Telegram 的卡住类诊断）
@@ -55,6 +56,9 @@ clawmonitor status --format json
 clawmonitor status --format md
 clawmonitor status --format md --detail
 clawmonitor cron
+clawmonitor models
+clawmonitor models --mode direct --format json
+clawmonitor models --mode openclaw --timeout 15
 clawmonitor tree
 clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
@@ -82,8 +86,11 @@ clawmonitor watch --interval 1
 ## TUI 快捷键
 
 - `↑/↓`：切换选中 session
+- `PgUp/PgDn`：整页向上 / 向下翻
+- `g` / `G`：跳到顶部 / 底部
 - `Enter`：对选中 session 发送 nudge（选择模板）
 - `?`：显示帮助说明
+- `v`：切换 Session / Model 视图
 - `x`：Focus 过滤（隐藏陈旧/不重要 session）
 - `t`：切换树形视图（按 agent 分组）
 - `c`：切换是否在树里显示 cron jobs
@@ -97,6 +104,18 @@ clawmonitor watch --interval 1
 - `q`：退出
 
 若终端支持颜色，行会按健康度着色：`OK` 绿 / `RUN` 青 / `IDLE` 黄 / `ALERT` 红。
+
+模型视图说明：
+
+- 模型视图默认手动刷新；按 `v` 切过去以后，再按 `r` 执行一次探测。
+- 顶部会显示显眼的状态条：`WAITING` / `RUNNING` / `DONE` / `ERROR`，可以明确知道是否真的开始跑了。
+- 每一行对应一个生效中的 `agent + model` 组合，会显示它在链路里的角色（`primary` / `fallbackN`）。
+- 支持两类探测：
+  - 直连 provider/API（`--mode direct` 或 `both`）
+  - 通过 OpenClaw 自己执行一次临时 probe session（`--mode openclaw` 或 `both`）
+- 目前已支持的直连 transport：`openai-completions`、`openai-responses`、`anthropic-messages`
+
+更多细节见：`docs/model-monitor.md`
 
 ## Telegram 说明：ACP 线程绑定（thread bindings）
 

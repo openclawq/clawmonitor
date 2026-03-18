@@ -96,6 +96,11 @@ def _internal_activity_at(tail: Any) -> Optional[datetime]:
     except Exception:
         pass
     try:
+        if tail.last_tool_result and tail.last_tool_result.ts:
+            candidates.append(tail.last_tool_result.ts)
+    except Exception:
+        pass
+    try:
         if tail.last_entry_type and tail.last_entry_type != "message" and tail.last_entry_ts:
             candidates.append(tail.last_entry_ts)
     except Exception:
@@ -128,6 +133,9 @@ class StatusRow:
     human_out_age: str
     internal_at: str
     internal_age: str
+    last_tool_at: str
+    last_tool_name: str
+    last_tool_ok: str
     run_for: str
     task_preview: str
     last_user_preview: str
@@ -228,6 +236,15 @@ def collect_status(
         acct_info = _channel_account_info(channels, channel=meta.channel, account_id=meta.account_id)
         out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info, dict) and isinstance(acct_info.get("lastOutboundAt"), int) else None)
         internal_at = _internal_activity_at(tail)
+        last_tool_at = "-"
+        last_tool_name = "-"
+        last_tool_ok = "-"
+        if getattr(tail, "last_tool_result", None):
+            tr = tail.last_tool_result
+            if tr:
+                last_tool_at = _fmt_dt(tr.ts)
+                last_tool_name = tr.tool_name or "-"
+                last_tool_ok = "err" if tr.is_error else "ok"
 
         task_preview = "-"
         if computed.state == WorkState.WORKING:
@@ -278,6 +295,9 @@ def collect_status(
                 human_out_age=_fmt_age(_age_seconds(out_at)),
                 internal_at=_fmt_dt(internal_at),
                 internal_age=_fmt_age(_age_seconds(internal_at)),
+                last_tool_at=last_tool_at,
+                last_tool_name=last_tool_name,
+                last_tool_ok=last_tool_ok,
                 run_for=run_for,
                 task_preview=task_preview[:120] if task_preview else "-",
                 last_user_preview=user_preview[:120] if user_preview else "-",
@@ -337,6 +357,7 @@ def format_markdown(rows: List[StatusRow], limit: Optional[int] = None, *, detai
         "assistantAge",
         "outAgeHuman",
         "thinkAge",
+        "lastTool",
         "runFor",
         "flags",
         "sessionKey",
@@ -358,6 +379,7 @@ def format_markdown(rows: List[StatusRow], limit: Optional[int] = None, *, detai
             esc(r.assistant_age),
             esc(r.human_out_age),
             esc(r.internal_age),
+            esc(f"{r.last_tool_name}:{r.last_tool_ok}" if r.last_tool_name != "-" and r.last_tool_ok != "-" else "-"),
             esc(r.run_for),
             esc(",".join(r.flags) if r.flags else "-"),
         ]
@@ -393,6 +415,9 @@ def format_json(rows: List[StatusRow], openclaw_root: Path) -> str:
                 "humanOutAge": r.human_out_age,
                 "thinkAt": r.internal_at,
                 "thinkAge": r.internal_age,
+                "lastToolAt": r.last_tool_at,
+                "lastToolName": r.last_tool_name,
+                "lastToolOk": r.last_tool_ok,
                 "assistantModel": r.assistant_model,
                 "assistantProvider": r.assistant_provider,
                 "acpState": r.acp_state,
