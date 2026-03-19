@@ -787,6 +787,7 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.session_detail_mode = "status"
         self.history_range_days = 1
+        self.detail_zoom = False
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
@@ -1403,11 +1404,74 @@ class ClawMonitorTUI:
         attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         return text, attr
 
-    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
-        node_w = max(10, min(18, int(w * 0.20)))
+    def _session_list_layout(self, width: int) -> Dict[str, int | bool]:
+        if width < 68:
+            node_w = max(8, min(14, width // 4))
+            state_w = 9
+            return {
+                "node_w": node_w,
+                "state_w": state_w,
+                "flags_w": 0,
+                "show_u_age": False,
+                "show_a_age": False,
+                "show_run": False,
+                "show_flags": False,
+            }
+        if width < 90:
+            node_w = max(10, min(16, int(width * 0.20)))
+            state_w = 10
+            flags_w = max(8, min(10, int(width * 0.16)))
+            return {
+                "node_w": node_w,
+                "state_w": state_w,
+                "flags_w": flags_w,
+                "show_u_age": False,
+                "show_a_age": False,
+                "show_run": False,
+                "show_flags": True,
+            }
+        node_w = max(10, min(18, int(width * 0.20)))
         state_w = 11
-        flags_w = max(8, min(12, int(w * 0.16)))
-        header = f"{_fit('NODE', node_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
+        flags_w = max(8, min(12, int(width * 0.16)))
+        return {
+            "node_w": node_w,
+            "state_w": state_w,
+            "flags_w": flags_w,
+            "show_u_age": True,
+            "show_a_age": True,
+            "show_run": True,
+            "show_flags": True,
+        }
+
+    def _footer_height(self, total_h: int) -> int:
+        return 2 if total_h >= 12 else 1
+
+    def _draw_footer(self, stdscr: "curses._CursesWindow", width: int, lines: List[str]) -> None:
+        h, _ = stdscr.getmaxyx()
+        footer_h = self._footer_height(h)
+        start_y = h - footer_h
+        render_lines = lines[-footer_h:]
+        while len(render_lines) < footer_h:
+            render_lines.insert(0, "")
+        for idx, line in enumerate(render_lines):
+            self._safe_addnstr(stdscr, start_y + idx, 0, line.ljust(width), width, curses.A_REVERSE)
+
+    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
+        layout = self._session_list_layout(w)
+        node_w = int(layout["node_w"])
+        state_w = int(layout["state_w"])
+        flags_w = int(layout["flags_w"])
+        header_parts = [_fit("NODE", node_w), _fit("STATE", state_w)]
+        if bool(layout["show_u_age"]):
+            header_parts.append("U-AGE")
+        if bool(layout["show_a_age"]):
+            header_parts.append("A-AGE")
+        if bool(layout["show_run"]):
+            header_parts.append("RUN")
+        if bool(layout["show_flags"]):
+            header_parts.append(_fit("FLAGS", flags_w))
+        header_parts.append("SESSION")
+        header = "  ".join(header_parts)
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
         visible = max(0, h - 1)
@@ -1441,13 +1505,20 @@ class ClawMonitorTUI:
                 flags = ",".join(flags_list)
                 name = job.name or job.id
                 sess = f"{name} ({job.id[:8]})"
-                line = (
-                    f"{_fit(node_text, node_w)}  "
-                    f"{_fit(status, state_w)}  "
-                    f"{'-':>5}  {'-':>5}  {run_age:>5}  "
-                    f"{_fit(flags, flags_w)}  "
-                    f"{sess}"
-                )
+                parts = [
+                    _fit(node_text, node_w),
+                    _fit(status, state_w),
+                ]
+                if bool(layout["show_u_age"]):
+                    parts.append(f"{'-':>5}")
+                if bool(layout["show_a_age"]):
+                    parts.append(f"{'-':>5}")
+                if bool(layout["show_run"]):
+                    parts.append(f"{run_age:>5}")
+                if bool(layout["show_flags"]):
+                    parts.append(_fit(flags, flags_w))
+                parts.append(sess)
+                line = "  ".join(parts)
                 self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w)
                 continue
 
@@ -1500,13 +1571,20 @@ class ClawMonitorTUI:
                         lbl2 = f"{lbl}({suf})" if suf else lbl
                         node_leaf = f"{it.node_label}:{lbl2}"
             node_text = f"{indent}- {node_leaf}"
-            line = (
-                f"{_fit(node_text, node_w)}  "
-                f"{_fit(sv.computed.state.value, state_w)}  "
-                f"{u_age:>5}  {a_age:>5}  {run:>5}  "
-                f"{_fit(flag_str, flags_w)}  "
-                f"{it.key_tail}"
-            )
+            parts = [
+                _fit(node_text, node_w),
+                _fit(sv.computed.state.value, state_w),
+            ]
+            if bool(layout["show_u_age"]):
+                parts.append(f"{u_age:>5}")
+            if bool(layout["show_a_age"]):
+                parts.append(f"{a_age:>5}")
+            if bool(layout["show_run"]):
+                parts.append(f"{run:>5}")
+            if bool(layout["show_flags"]):
+                parts.append(_fit(flag_str, flags_w))
+            parts.append(it.key_tail)
+            line = "  ".join(parts)
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
 
@@ -2386,6 +2464,7 @@ class ClawMonitorTUI:
             "  r              Refresh now, or load/reload history in History view",
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
+            "  z              Zoom right-side detail pane",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
             "  n              Toggle NODE label mode (channel:label)",
@@ -2438,7 +2517,12 @@ class ClawMonitorTUI:
             "  - Focus filter keeps WORKING/ALERT/recent/labeled sessions; press [x] to see all.",
             "  - Reports/logs are redacted, but review before sharing.",
             "",
-            "Press any key to close.",
+            "Help Navigation:",
+            "  ↑/↓ or j/k     Scroll line by line",
+            "  PgUp/PgDn      Scroll page by page",
+            "  g / G          Jump to start / end",
+            "",
+            "Press q, Esc, Enter, or ? to close.",
         ]
 
         h, w = stdscr.getmaxyx()
@@ -2454,7 +2538,8 @@ class ClawMonitorTUI:
             win.clear()
             win.border()
             try:
-                self._safe_addnstr(win, 0, 2, " Help ", win_w - 4)
+                title = f" Help  {scroll + 1}-{min(len(lines), scroll + (win_h - 2))}/{len(lines)} "
+                self._safe_addnstr(win, 0, 2, title, win_w - 4)
             except curses.error:
                 pass
             view = lines[scroll : scroll + (win_h - 2)]
@@ -2471,6 +2556,14 @@ class ClawMonitorTUI:
                 scroll = max(0, scroll - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
                 scroll = min(max(0, len(lines) - (win_h - 2)), scroll + 1)
+            elif ch == curses.KEY_PPAGE:
+                scroll = max(0, scroll - max(1, win_h - 3))
+            elif ch in (curses.KEY_NPAGE, ord(" ")):
+                scroll = min(max(0, len(lines) - (win_h - 2)), scroll + max(1, win_h - 3))
+            elif ch in (curses.KEY_HOME, ord("g")):
+                scroll = 0
+            elif ch in (curses.KEY_END, ord("G")):
+                scroll = max(0, len(lines) - (win_h - 2))
 
     def _export_report(self, sv: SessionView) -> None:
         rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=self.cfg.report_max_log_lines)
@@ -2771,6 +2864,9 @@ class ClawMonitorTUI:
             elif ch == ord("h") and self.view_mode == "sessions":
                 self.session_detail_mode = "history" if self.session_detail_mode == "status" else "status"
                 dirty = True
+            elif ch == ord("z") and self.view_mode == "sessions":
+                self.detail_zoom = not self.detail_zoom
+                dirty = True
             elif ch == ord("1") and self.view_mode == "sessions":
                 self.history_range_days = 1
                 dirty = True
@@ -2851,14 +2947,25 @@ class ClawMonitorTUI:
             self._draw_header(stdscr, w)
 
             content_y = 2
-            list_h = h - 3
+            footer_h = self._footer_height(h)
+            list_h = h - content_y - footer_h
             if self.view_mode == "models":
                 banner, banner_attr = self._model_banner()
                 self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
                 content_y = 3
-                list_h = h - 4
-            list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
+                list_h = h - content_y - footer_h
+            if self.view_mode == "sessions":
+                if self.detail_zoom:
+                    if self.session_detail_mode == "history":
+                        list_w = max(22, min(30, max(22, int(w * 0.24))))
+                    else:
+                        list_w = max(24, min(36, max(24, int(w * 0.28))))
+                else:
+                    list_w = max(40, min(max(40, int(w * 0.46)), max(0, w - 28)))
+            else:
+                list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
             detail_w = w - list_w - 1
+            warning_y = max(content_y, h - footer_h - 1)
             if self.view_mode == "models":
                 self._draw_model_list(stdscr, y=content_y, h=list_h, w=list_w, rows=model_rows)
                 model_row = self._selected_model(model_rows)
@@ -2871,7 +2978,7 @@ class ClawMonitorTUI:
                 else:
                     self._safe_addnstr(
                         stdscr,
-                        h - 2,
+                        warning_y,
                         0,
                         "Terminal too narrow for model details. Widen window or use `clawmonitor models`.".ljust(w),
                         w,
@@ -2889,7 +2996,7 @@ class ClawMonitorTUI:
                 else:
                     self._safe_addnstr(
                         stdscr,
-                        h - 2,
+                        warning_y,
                         0,
                         "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
                         w,
@@ -2951,22 +3058,32 @@ class ClawMonitorTUI:
                     (
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
+                        f"[z]{'zoom' if self.detail_zoom else 'split'} "
                         f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
                         f"[x]{'focus' if self.focus_mode else 'all'} "
                         f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
                         f"[1/7]historyRange={self.history_range_days}d "
-                        f"[R]rename [Enter]nudge [e]export [b]bottom  "
-                        f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                        f"lastRefresh={refresh_age}{refresh_note}{history_note}"
+                        f"[R]rename [Enter]nudge [e]export [b]bottom"
                     )
                     if self.view_mode == "sessions"
                     else (
-                        f"manual-model-probe sel={sel_pos}/{sel_total} "
-                        f"rows={len(model_rows)} lastRefresh={refresh_age}{refresh_note}"
+                        f"manual-model-probe [f]interval={int(self.refresh_seconds)} "
+                        f"sel={sel_pos}/{sel_total} rows={len(model_rows)}"
                     )
                 )
             )
-            self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
+            footer_lines = [footer]
+            if self.view_mode == "sessions":
+                footer_lines.append(
+                    f"detail={self.session_detail_mode} zoom={'on' if self.detail_zoom else 'off'} "
+                    f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}"
+                )
+            else:
+                footer_lines.append(
+                    f"manual-model-probe sel={sel_pos}/{sel_total} rows={len(model_rows)} lastRefresh={refresh_age}{refresh_note}"
+                )
+            self._draw_footer(stdscr, w, footer_lines)
 
             stdscr.refresh()
             dirty = False
