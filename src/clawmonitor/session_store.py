@@ -26,6 +26,15 @@ class SessionMeta:
     acpx_session_id: Optional[str]
     acp_agent: Optional[str]
     acp_identity_state: Optional[str]
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    total_tokens: Optional[int]
+    context_tokens: Optional[int]
+    total_tokens_fresh: Optional[bool]
+    cache_read_tokens: Optional[int]
+    cache_write_tokens: Optional[int]
+    model_provider: Optional[str]
+    model_name: Optional[str]
 
 
 def _safe_int(v: Any) -> Optional[int]:
@@ -121,6 +130,15 @@ def list_sessions(openclaw_root: Path) -> List[SessionMeta]:
                     acpx_session_id=acpx_session_id,
                     acp_agent=acp_agent,
                     acp_identity_state=acp_identity_state,
+                    input_tokens=_safe_int(entry.get("inputTokens")),
+                    output_tokens=_safe_int(entry.get("outputTokens")),
+                    total_tokens=_safe_int(entry.get("totalTokens")),
+                    context_tokens=_safe_int(entry.get("contextTokens")),
+                    total_tokens_fresh=bool(entry.get("totalTokensFresh")) if "totalTokensFresh" in entry else None,
+                    cache_read_tokens=_safe_int(entry.get("cacheRead")),
+                    cache_write_tokens=_safe_int(entry.get("cacheWrite")),
+                    model_provider=str(entry.get("modelProvider")) if isinstance(entry.get("modelProvider"), str) and entry.get("modelProvider") else None,
+                    model_name=str(entry.get("model")) if isinstance(entry.get("model"), str) and entry.get("model") else None,
                 )
             )
     out.sort(key=lambda s: (s.updated_at_ms or 0), reverse=True)

@@ -107,6 +107,30 @@ def _fmt_age(age: Optional[int]) -> str:
     return f"{age//3600:>3}h"
 
 
+def _fmt_tokens_short(value: Optional[int]) -> str:
+    if value is None:
+        return "-"
+    if value < 1000:
+        return str(value)
+    if value < 100000:
+        text = f"{value / 1000.0:.1f}k"
+    elif value < 1000000:
+        text = f"{round(value / 1000.0):.0f}k"
+    else:
+        text = f"{value / 1000000.0:.1f}m"
+    return text.replace(".0k", "k").replace(".0m", "m")
+
+
+def _fmt_ratio_pct(numer: Optional[int], denom: Optional[int]) -> str:
+    if numer is None or denom is None or denom <= 0:
+        return "-"
+    try:
+        pct = max(0, min(999, int(round((numer / denom) * 100.0))))
+    except Exception:
+        return "-"
+    return f"{pct}%"
+
+
 def _fit(text: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -786,6 +810,7 @@ class ClawMonitorTUI:
         self.selected_model_key: Optional[str] = None
         self.show_logs = True
         self.session_detail_mode = "status"
+        self.session_metric_page = "activity"
         self.history_range_days = 1
         self.pane_zoom_mode = "even"  # even | detail | list | sessions
         self.detail_fullscreen = False
@@ -1385,7 +1410,10 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, 0, 0, head.ljust(width), width, curses.A_REVERSE)
         legend = ""
         if self.view_mode == "sessions":
-            legend = "  |  Legend: USER=last user idle  ASST=last assistant idle  RUN=active run duration"
+            legend = (
+                "  |  Legend: USER=last user idle  ASST=last assistant idle  RUN=active run duration"
+                f"  |  Cols: {self._session_metric_page_label()}"
+            )
         if channels and isinstance(channels.raw.get("channelOrder"), list):
             chan_names = ", ".join([str(x) for x in channels.raw.get("channelOrder", [])])
             self._safe_addnstr(stdscr, 1, 0, f"Channels: {chan_names}{legend}".ljust(width), width)
@@ -1424,11 +1452,102 @@ class ClawMonitorTUI:
         attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         return text, attr
 
-    def _session_list_layout(self, width: int) -> Dict[str, int | bool]:
+    def _session_cache_tokens(self, sv: SessionView) -> Optional[int]:
+        vals = [sv.meta.cache_read_tokens or 0, sv.meta.cache_write_tokens or 0]
+        total = sum(vals)
+        return total if total > 0 else None
+
+    def _session_context_pct(self, sv: SessionView) -> str:
+        return _fmt_ratio_pct(sv.meta.total_tokens, sv.meta.context_tokens)
+
+    def _session_usage_lines(self, sv: SessionView) -> List[str]:
+        provider = sv.meta.model_provider
+        model = sv.meta.model_name
+        if sv.tail.last_assistant:
+            provider = provider or sv.tail.last_assistant.provider
+            model = model or sv.tail.last_assistant.model
+        model_text = f"{provider or '-'} / {model or '-'}"
+        fresh = "-"
+        if sv.meta.total_tokens_fresh is True:
+            fresh = "yes"
+        elif sv.meta.total_tokens_fresh is False:
+            fresh = "no"
+        line1 = (
+            f"Token: in={_fmt_tokens_short(sv.meta.input_tokens)} "
+            f"out={_fmt_tokens_short(sv.meta.output_tokens)} "
+            f"cacheR={_fmt_tokens_short(sv.meta.cache_read_tokens)} "
+            f"cacheW={_fmt_tokens_short(sv.meta.cache_write_tokens)} "
+            f"fresh={fresh}"
+        )
+        line2 = (
+            f"Context: prompt={_fmt_tokens_short(sv.meta.total_tokens)} / {_fmt_tokens_short(sv.meta.context_tokens)} "
+            f"used={self._session_context_pct(sv)}  model={model_text}"
+        )
+        return [line1, line2]
+
+    def _session_list_layout(self, width: int) -> Dict[str, int | bool | str]:
+        page = self.session_metric_page
+        if page == "tokens":
+            if width < 56:
+                return {
+                    "page": page,
+                    "node_w": max(7, min(10, width // 5)),
+                    "state_w": 6,
+                    "tok_in_w": 6,
+                    "tok_out_w": 6,
+                    "tok_cache_w": 0,
+                    "tok_ctx_w": 0,
+                    "show_tok_in": True,
+                    "show_tok_out": True,
+                    "show_tok_cache": False,
+                    "show_tok_ctx": False,
+                }
+            if width < 74:
+                return {
+                    "page": page,
+                    "node_w": max(8, min(11, int(width * 0.16))),
+                    "state_w": 6,
+                    "tok_in_w": 6,
+                    "tok_out_w": 6,
+                    "tok_cache_w": 0,
+                    "tok_ctx_w": 5,
+                    "show_tok_in": True,
+                    "show_tok_out": True,
+                    "show_tok_cache": False,
+                    "show_tok_ctx": True,
+                }
+            if width < 92:
+                return {
+                    "page": page,
+                    "node_w": max(8, min(12, int(width * 0.16))),
+                    "state_w": 7,
+                    "tok_in_w": 6,
+                    "tok_out_w": 6,
+                    "tok_cache_w": 6,
+                    "tok_ctx_w": 5,
+                    "show_tok_in": True,
+                    "show_tok_out": True,
+                    "show_tok_cache": True,
+                    "show_tok_ctx": True,
+                }
+            return {
+                "page": page,
+                "node_w": max(9, min(14, int(width * 0.16))),
+                "state_w": 8,
+                "tok_in_w": 7,
+                "tok_out_w": 7,
+                "tok_cache_w": 7,
+                "tok_ctx_w": 6,
+                "show_tok_in": True,
+                "show_tok_out": True,
+                "show_tok_cache": True,
+                "show_tok_ctx": True,
+            }
         if width < 56:
             node_w = max(7, min(10, width // 5))
             state_w = 6
             return {
+                "page": page,
                 "node_w": node_w,
                 "state_w": state_w,
                 "flags_w": 0,
@@ -1441,6 +1560,7 @@ class ClawMonitorTUI:
             node_w = max(8, min(11, int(width * 0.16)))
             state_w = 6
             return {
+                "page": page,
                 "node_w": node_w,
                 "state_w": state_w,
                 "flags_w": 0,
@@ -1454,6 +1574,7 @@ class ClawMonitorTUI:
             state_w = 7
             flags_w = max(7, min(9, int(width * 0.12)))
             return {
+                "page": page,
                 "node_w": node_w,
                 "state_w": state_w,
                 "flags_w": flags_w,
@@ -1466,6 +1587,7 @@ class ClawMonitorTUI:
         state_w = 8
         flags_w = max(7, min(10, int(width * 0.12)))
         return {
+            "page": page,
             "node_w": node_w,
             "state_w": state_w,
             "flags_w": flags_w,
@@ -1504,10 +1626,28 @@ class ClawMonitorTUI:
             "sessions": "left100",
         }.get(self.pane_zoom_mode, "50/50")
 
+    def _session_metric_pages(self) -> List[str]:
+        return ["activity", "tokens"]
+
+    def _session_metric_page_label(self) -> str:
+        return {
+            "activity": "activity",
+            "tokens": "tokens-now",
+        }.get(self.session_metric_page, self.session_metric_page)
+
+    def _cycle_session_metric_page(self, delta: int) -> None:
+        pages = self._session_metric_pages()
+        try:
+            idx = pages.index(self.session_metric_page)
+        except ValueError:
+            idx = 0
+        self.session_metric_page = pages[(idx + delta) % len(pages)]
+
     def _surface_is_default(self) -> bool:
         return (
             self.view_mode == "sessions"
             and self.session_detail_mode == "status"
+            and self.session_metric_page == "activity"
             and self.pane_zoom_mode == "even"
             and not self.detail_fullscreen
         )
@@ -1515,6 +1655,7 @@ class ClawMonitorTUI:
     def _reset_surface_state(self) -> None:
         self.view_mode = "sessions"
         self.session_detail_mode = "status"
+        self.session_metric_page = "activity"
         self.pane_zoom_mode = "even"
         self.detail_fullscreen = False
 
@@ -1581,16 +1722,27 @@ class ClawMonitorTUI:
         layout = self._session_list_layout(w)
         node_w = int(layout["node_w"])
         state_w = int(layout["state_w"])
-        flags_w = int(layout["flags_w"])
+        page = str(layout.get("page") or "activity")
         header_parts = [_fit("NODE", node_w), _fit("STATE", state_w)]
-        if bool(layout["show_u_age"]):
-            header_parts.append("USER")
-        if bool(layout["show_a_age"]):
-            header_parts.append("ASST")
-        if bool(layout["show_run"]):
-            header_parts.append("RUN")
-        if bool(layout["show_flags"]):
-            header_parts.append(_fit("FLAGS", flags_w))
+        flags_w = int(layout.get("flags_w") or 0)
+        if page == "tokens":
+            if bool(layout["show_tok_in"]):
+                header_parts.append(_fit("IN", int(layout["tok_in_w"])))
+            if bool(layout["show_tok_out"]):
+                header_parts.append(_fit("OUT", int(layout["tok_out_w"])))
+            if bool(layout["show_tok_cache"]):
+                header_parts.append(_fit("CACHE", int(layout["tok_cache_w"])))
+            if bool(layout["show_tok_ctx"]):
+                header_parts.append(_fit("CTX", int(layout["tok_ctx_w"])))
+        else:
+            if bool(layout["show_u_age"]):
+                header_parts.append("USER")
+            if bool(layout["show_a_age"]):
+                header_parts.append("ASST")
+            if bool(layout["show_run"]):
+                header_parts.append("RUN")
+            if bool(layout["show_flags"]):
+                header_parts.append(_fit("FLAGS", flags_w))
         header_parts.append("SESSION")
         header = "  ".join(header_parts)
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
@@ -1630,14 +1782,24 @@ class ClawMonitorTUI:
                     _fit(node_text, node_w),
                     _fit(status, state_w),
                 ]
-                if bool(layout["show_u_age"]):
-                    parts.append(f"{'-':>5}")
-                if bool(layout["show_a_age"]):
-                    parts.append(f"{'-':>5}")
-                if bool(layout["show_run"]):
-                    parts.append(f"{run_age:>5}")
-                if bool(layout["show_flags"]):
-                    parts.append(_fit(flags, flags_w))
+                if page == "tokens":
+                    if bool(layout["show_tok_in"]):
+                        parts.append(_fit("-", int(layout["tok_in_w"])))
+                    if bool(layout["show_tok_out"]):
+                        parts.append(_fit("-", int(layout["tok_out_w"])))
+                    if bool(layout["show_tok_cache"]):
+                        parts.append(_fit("-", int(layout["tok_cache_w"])))
+                    if bool(layout["show_tok_ctx"]):
+                        parts.append(_fit("-", int(layout["tok_ctx_w"])))
+                else:
+                    if bool(layout["show_u_age"]):
+                        parts.append(f"{'-':>5}")
+                    if bool(layout["show_a_age"]):
+                        parts.append(f"{'-':>5}")
+                    if bool(layout["show_run"]):
+                        parts.append(f"{run_age:>5}")
+                    if bool(layout["show_flags"]):
+                        parts.append(_fit(flags, flags_w))
                 parts.append(sess)
                 line = "  ".join(parts)
                 self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w)
@@ -1696,14 +1858,24 @@ class ClawMonitorTUI:
                 _fit(node_text, node_w),
                 _fit(self._state_short_label(sv.computed.state.value), state_w),
             ]
-            if bool(layout["show_u_age"]):
-                parts.append(f"{u_age:>5}")
-            if bool(layout["show_a_age"]):
-                parts.append(f"{a_age:>5}")
-            if bool(layout["show_run"]):
-                parts.append(f"{run:>5}")
-            if bool(layout["show_flags"]):
-                parts.append(_fit(flag_str, flags_w))
+            if page == "tokens":
+                if bool(layout["show_tok_in"]):
+                    parts.append(_fit(_fmt_tokens_short(sv.meta.input_tokens), int(layout["tok_in_w"])))
+                if bool(layout["show_tok_out"]):
+                    parts.append(_fit(_fmt_tokens_short(sv.meta.output_tokens), int(layout["tok_out_w"])))
+                if bool(layout["show_tok_cache"]):
+                    parts.append(_fit(_fmt_tokens_short(self._session_cache_tokens(sv)), int(layout["tok_cache_w"])))
+                if bool(layout["show_tok_ctx"]):
+                    parts.append(_fit(self._session_context_pct(sv), int(layout["tok_ctx_w"])))
+            else:
+                if bool(layout["show_u_age"]):
+                    parts.append(f"{u_age:>5}")
+                if bool(layout["show_a_age"]):
+                    parts.append(f"{a_age:>5}")
+                if bool(layout["show_run"]):
+                    parts.append(f"{run:>5}")
+                if bool(layout["show_flags"]):
+                    parts.append(_fit(flag_str, flags_w))
             parts.append(it.key_tail)
             line = "  ".join(parts)
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
@@ -2161,6 +2333,7 @@ class ClawMonitorTUI:
                 f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
             )
         lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
+        lines.extend(self._session_usage_lines(sv))
         if sv.lock:
             lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
         else:
@@ -2236,6 +2409,7 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        status_lines.extend(self._session_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
@@ -2348,6 +2522,8 @@ class ClawMonitorTUI:
             attr = 0
             if ln.startswith(("Task:", "Thinking:", "Trigger:", "ToolCall:", "ToolResult:")):
                 attr = self._color_magenta if self._colors_enabled else 0
+            elif ln.startswith(("Token:", "Context:")):
+                attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
             elif ln.startswith("Diagnosis:"):
                 if not self._colors_enabled:
                     attr = curses.A_BOLD
@@ -2460,6 +2636,7 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        status_lines.extend(self._session_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
@@ -2526,6 +2703,8 @@ class ClawMonitorTUI:
             attr = 0
             if ln.startswith(("Task:", "Thinking:", "Trigger:")):
                 attr = self._color_magenta if self._colors_enabled else 0
+            elif ln.startswith(("Token:", "Context:")):
+                attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         # Last User Send
@@ -2729,6 +2908,7 @@ class ClawMonitorTUI:
             "  z / Z          Cycle split/detail/list panes / fullscreen detail",
             "  h              Toggle Status / History",
             "  r              Refresh, or load/reload History",
+            "  ← / →          Switch left-list metric columns (activity / tokens)",
             "  1 / 7          History range 1 day / 7 days",
             "  b              Bottom panel toggle",
             "",
@@ -2782,7 +2962,10 @@ class ClawMonitorTUI:
             "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
             "",
             "Left list columns:",
-            "  NODE, STATE, USER, ASST, RUN, FLAGS, SESSION",
+            "  Frozen columns: NODE, STATE",
+            "  Metric pages: activity(USER/ASST/RUN/FLAGS) or tokens(IN/OUT/CACHE/CTX)",
+            "  Use ← / → to switch column pages.",
+            "  Token page: IN=input, OUT=output, CACHE=cache read+write, CTX=prompt/context percent.",
             "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
             "FLAGS column (compact):",
@@ -3084,6 +3267,12 @@ class ClawMonitorTUI:
                 else:
                     self._move_selection(items, -1)
                 dirty = True
+            elif ch == curses.KEY_LEFT and self.view_mode == "sessions":
+                self._cycle_session_metric_page(-1)
+                dirty = True
+            elif ch == curses.KEY_RIGHT and self.view_mode == "sessions":
+                self._cycle_session_metric_page(1)
+                dirty = True
             elif ch == curses.KEY_DOWN:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
@@ -3322,7 +3511,7 @@ class ClawMonitorTUI:
                         stdscr,
                         warning_y,
                         0,
-                        "LEFT LIST FOCUS ACTIVE  Press [z] for 50/50/detail/left80, or [Z] for fullscreen detail.".ljust(w),
+                        f"LEFT LIST FOCUS ACTIVE  Cols={self._session_metric_page_label()}  Press [←/→] to switch columns, [z] for 50/50/detail/left80, or [Z] for fullscreen detail.".ljust(w),
                         w,
                         curses.A_BOLD | (self._color_working if self._colors_enabled else 0),
                     )
@@ -3398,8 +3587,10 @@ class ClawMonitorTUI:
                 + (
                     (
                         (
+                            f"[←/→]cols "
                             f"[f]interval={int(self.refresh_seconds)}s "
                             f"[h]{self.session_detail_mode} "
+                            f"[cols]{self._session_metric_page_label()} "
                             f"[z]{self._pane_zoom_label()} "
                             f"[Z]{'full' if self.detail_fullscreen else 'pane'} "
                             f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
@@ -3410,8 +3601,10 @@ class ClawMonitorTUI:
                         )
                         if self.session_detail_mode == "history"
                         else
+                        f"[←/→]cols "
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
+                        f"[cols]{self._session_metric_page_label()} "
                         f"[z]{self._pane_zoom_label()} "
                         f"[Z]{'full' if self.detail_fullscreen else 'pane'} "
                         f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
@@ -3430,11 +3623,11 @@ class ClawMonitorTUI:
             footer_lines = [footer]
             if self.view_mode == "sessions":
                 if self.session_detail_mode == "history":
-                    tip = "tip=[j/k] history [Enter] detail [7] wider-window [r] reload [Esc] reset [jj/kk] agent jump"
+                    tip = "tip=[←/→] cols [j/k] history [Enter] detail [7] wider-window [r] reload [Esc] reset [jj/kk] agent jump"
                 else:
-                    tip = "tip=[h] history [b] bottom [z] panes [Z] fullscreen [Esc] reset [jj/kk] agent jump"
+                    tip = "tip=[←/→] cols [h] history [b] bottom [z] panes [Z] fullscreen [Esc] reset [jj/kk] agent jump"
                 footer_lines.append(
-                    f"detail={self.session_detail_mode} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
+                    f"detail={self.session_detail_mode} cols={self._session_metric_page_label()} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
                     f"lastRefresh={refresh_age}{refresh_note}{history_note}  {tip}"
                 )
