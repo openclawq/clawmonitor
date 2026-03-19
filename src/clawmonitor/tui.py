@@ -791,6 +791,8 @@ class ClawMonitorTUI:
         self.detail_fullscreen = False
         self._history_selected_by_key: Dict[str, int] = {}
         self._history_expanded_by_key: Dict[str, bool] = {}
+        self._last_nav_key: Optional[str] = None
+        self._last_nav_at: float = 0.0
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
@@ -1381,12 +1383,15 @@ class ClawMonitorTUI:
             f"Gateway: {mode}  |  {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         self._safe_addnstr(stdscr, 0, 0, head.ljust(width), width, curses.A_REVERSE)
+        legend = ""
+        if self.view_mode == "sessions":
+            legend = "  |  Legend: USER=last user idle  ASST=last assistant idle  RUN=active run duration"
         if channels and isinstance(channels.raw.get("channelOrder"), list):
             chan_names = ", ".join([str(x) for x in channels.raw.get("channelOrder", [])])
-            self._safe_addnstr(stdscr, 1, 0, f"Channels: {chan_names}".ljust(width), width)
+            self._safe_addnstr(stdscr, 1, 0, f"Channels: {chan_names}{legend}".ljust(width), width)
         else:
             err = self.model.gateway_log_tailer.last_error
-            self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
+            self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}{legend}".ljust(width), width)
 
     def _model_banner(self) -> Tuple[str, int]:
         with self._model_refresh_lock:
@@ -1498,6 +1503,60 @@ class ClawMonitorTUI:
             "list": "left80",
             "sessions": "left100",
         }.get(self.pane_zoom_mode, "50/50")
+
+    def _surface_is_default(self) -> bool:
+        return (
+            self.view_mode == "sessions"
+            and self.session_detail_mode == "status"
+            and self.pane_zoom_mode == "even"
+            and not self.detail_fullscreen
+        )
+
+    def _reset_surface_state(self) -> None:
+        self.view_mode = "sessions"
+        self.session_detail_mode = "status"
+        self.pane_zoom_mode = "even"
+        self.detail_fullscreen = False
+
+    def _should_jump_agent(self, key_name: str) -> bool:
+        now = time.time()
+        if self._last_nav_key == key_name and (now - self._last_nav_at) <= 0.35:
+            self._last_nav_key = None
+            self._last_nav_at = 0.0
+            return True
+        self._last_nav_key = key_name
+        self._last_nav_at = now
+        return False
+
+    def _move_selection_agent(self, items: List[ListItem], direction: int) -> None:
+        sv = self._selected_session(items)
+        if not sv or not self.tree_view:
+            self._move_selection(items, direction)
+            return
+        current_agent = sv.meta.agent_id or "-"
+        selectable_indexes = [i for i, item in enumerate(items) if isinstance(item, _ListSession)]
+        if not selectable_indexes:
+            return
+        current_idx = self.selected
+        if direction > 0:
+            search = [i for i in selectable_indexes if i > current_idx]
+        else:
+            search = [i for i in reversed(selectable_indexes) if i < current_idx]
+        target = None
+        for idx in search:
+            item = items[idx]
+            if not isinstance(item, _ListSession):
+                continue
+            if (item.sv.meta.agent_id or "-") != current_agent:
+                target = idx
+                break
+        if target is None:
+            end_idx = selectable_indexes[-1] if direction > 0 else selectable_indexes[0]
+            target = end_idx
+        self.selected = target
+        new_sv = self._selected_session(items)
+        if new_sv:
+            self.selected_session_key = new_sv.meta.key
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
         layout = self._session_list_layout(w)
@@ -2573,7 +2632,9 @@ class ClawMonitorTUI:
             "  PgUp/PgDn      Page through sessions (status view) or history (history view)",
             "  g / G          Jump to top / bottom (list or history)",
             "  j / k          Select previous / next history item",
-            "  q or Esc       Quit",
+            "  double j / k   Jump to previous / next agent group",
+            "  Esc            Return to default surface; press Esc again to quit",
+            "  q              Quit immediately",
             "",
             "Actions:",
             "  v              Toggle session/model view",
@@ -2904,8 +2965,14 @@ class ClawMonitorTUI:
             h, _ = stdscr.getmaxyx()
             page_step = max(1, h - 6)
             history_step = max(1, (h - 8) // 2)
-            if ch in (ord("q"), 27):
+            if ch == ord("q"):
                 return
+            if ch == 27:
+                if self._surface_is_default():
+                    return
+                self._reset_surface_state()
+                dirty = True
+                continue
             if ch == curses.KEY_UP:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
@@ -2924,7 +2991,10 @@ class ClawMonitorTUI:
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
                 else:
-                    self._move_selection(items, -1)
+                    if self._should_jump_agent("k"):
+                        self._move_selection_agent(items, -1)
+                    else:
+                        self._move_selection(items, -1)
                 dirty = True
             elif ch == ord("j"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
@@ -2932,7 +3002,10 @@ class ClawMonitorTUI:
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
                 else:
-                    self._move_selection(items, 1)
+                    if self._should_jump_agent("j"):
+                        self._move_selection_agent(items, 1)
+                    else:
+                        self._move_selection(items, 1)
                 dirty = True
             elif ch in (curses.KEY_PPAGE,):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
@@ -3239,7 +3312,7 @@ class ClawMonitorTUI:
                 footer_lines.append(
                     f"detail={self.session_detail_mode} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[z] left100/50-50/detail/left80 [Z] right100 [?] help, press [?] again for full"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[Esc] reset [z] panes [Z] right100 [?] help-again=full [jj/kk] agent jump"
                 )
             else:
                 footer_lines.append(
