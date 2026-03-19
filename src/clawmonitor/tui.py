@@ -1540,16 +1540,35 @@ class ClawMonitorTUI:
         current_idx = self.selected
         if direction > 0:
             search = [i for i in selectable_indexes if i > current_idx]
+            target = None
+            for idx in search:
+                item = items[idx]
+                if not isinstance(item, _ListSession):
+                    continue
+                if (item.sv.meta.agent_id or "-") != current_agent:
+                    target = idx
+                    break
         else:
-            search = [i for i in reversed(selectable_indexes) if i < current_idx]
-        target = None
-        for idx in search:
-            item = items[idx]
-            if not isinstance(item, _ListSession):
-                continue
-            if (item.sv.meta.agent_id or "-") != current_agent:
-                target = idx
-                break
+            prev_agent = None
+            target = None
+            for idx in reversed(selectable_indexes):
+                if idx >= current_idx:
+                    continue
+                item = items[idx]
+                if not isinstance(item, _ListSession):
+                    continue
+                agent_id = item.sv.meta.agent_id or "-"
+                if agent_id == current_agent and prev_agent is None:
+                    continue
+                if prev_agent is None and agent_id != current_agent:
+                    prev_agent = agent_id
+                    target = idx
+                    continue
+                if prev_agent is not None:
+                    if agent_id == prev_agent:
+                        target = idx
+                        continue
+                    break
         if target is None:
             end_idx = selectable_indexes[-1] if direction > 0 else selectable_indexes[0]
             target = end_idx
@@ -1893,50 +1912,110 @@ class ClawMonitorTUI:
         else:
             header_attr |= self._color_ok if self._colors_enabled else 0
 
-        title = f"History  Range={self.history_range_days}d  State={status}  Cache={cache_mode}{elapsed}"
+        title = "HISTORY DETAIL  [r] load/reload  [1/7] range  [Enter] detail  [z] panes  [Z] fullscreen"
         self._safe_addnstr(stdscr, y, x, _fit(title, w), w, header_attr)
+        status_line = f"State={status}  Range={self.history_range_days}d  Cache={cache_mode}{elapsed}"
         if self.detail_fullscreen:
-            self._safe_addnstr(stdscr, y + 1, x, _fit("FULLSCREEN DETAIL ACTIVE  Press [Z] to return to split layout.", w), w, curses.A_BOLD | header_attr)
+            status_line += "  |  FULLSCREEN DETAIL ACTIVE"
+        self._safe_addnstr(stdscr, y + 1, x, _fit(status_line, w), w, curses.A_BOLD)
         path_text = str(sv.meta.session_file) if sv.meta.session_file else "-"
-        path_y = y + (2 if self.detail_fullscreen else 1)
-        self._safe_addnstr(stdscr, path_y, x, _fit(f"Transcript: {path_text}", w), w)
-        source_line = "Derived from transcript · best-effort"
+        self._safe_addnstr(stdscr, y + 2, x, _fit(f"Session: {sv.meta.key}", w), w)
+        self._safe_addnstr(stdscr, y + 3, x, _fit(f"Transcript: {path_text}", w), w)
+        source_line = "Derived from transcript | best-effort"
         if live_now:
-            source_line += " · LIVE TASK HISTORY"
+            source_line += " | LIVE TASK HISTORY"
         elif stale:
-            source_line += " · Press [r] to refresh"
-        self._safe_addnstr(stdscr, path_y + 1, x, _fit(source_line, w), w)
+            source_line += " | Press [r] to refresh"
+        self._safe_addnstr(stdscr, y + 4, x, _fit(source_line, w), w)
 
-        body_y = path_y + 3
+        body_y = y + 5
         body_h = max(0, h - (body_y - y) - 1)
         if body_h <= 0:
             return
 
         if state.load_state == "not_loaded" and result is None:
-            self._safe_addnstr(stdscr, body_y, x, "No history loaded. Press [r] to read this session transcript.", w)
+            self._safe_addnstr(
+                stdscr,
+                body_y,
+                x,
+                _fit("HISTORY LIST | No history loaded yet. Press [r] to read this session transcript.", w),
+                w,
+                curses.A_BOLD | (self._color_idle if self._colors_enabled else 0),
+            )
+            if body_y + 2 < y + h:
+                self._safe_addnstr(
+                    stdscr,
+                    body_y + 2,
+                    x,
+                    _fit("SELECTED EVENT | After loading, use [j/k] to move between tasks and read details below.", w),
+                    w,
+                    curses.A_BOLD,
+                )
             return
         if state.load_state == "loading" and result is None:
             msg = state.progress_msg or "Reading session history..."
-            self._safe_addnstr(stdscr, body_y, x, _fit(msg, w), w, curses.A_BOLD | (self._color_idle if self._colors_enabled else 0))
+            self._safe_addnstr(
+                stdscr,
+                body_y,
+                x,
+                _fit(f"HISTORY LIST | LOADING... {msg}", w),
+                w,
+                curses.A_BOLD | (self._color_idle if self._colors_enabled else 0),
+            )
+            if body_y + 1 < y + h:
+                self._safe_addnstr(
+                    stdscr,
+                    body_y + 1,
+                    x,
+                    _fit("Please wait. Large transcripts may take a moment on first read; later loads use cache.", w),
+                    w,
+                )
             return
         if state.load_state == "error" and result is None:
             err = state.error or "history load failed"
-            self._safe_addnstr(stdscr, body_y, x, _fit(f"History error: {err}", w), w, curses.A_BOLD | (self._color_alert if self._colors_enabled else 0))
+            self._safe_addnstr(
+                stdscr,
+                body_y,
+                x,
+                _fit(f"HISTORY LIST | ERROR: {err}", w),
+                w,
+                curses.A_BOLD | (self._color_alert if self._colors_enabled else 0),
+            )
             return
         if not events:
-            text = "No derived task history in the selected window."
             if state.load_state == "loading":
                 text = state.progress_msg or "Reading session history..."
             elif state.load_state == "error" and state.error:
                 text = f"History error: {state.error}"
-            self._safe_addnstr(stdscr, body_y, x, _fit(text, w), w)
+            elif result and result.events:
+                total_events = len(result.events)
+                if self.history_range_days < 7:
+                    text = f"No events in the current {self.history_range_days}d window. Press [7] to show 7d. Cached total={total_events}."
+                else:
+                    text = f"No events remain after filtering. Cached total={total_events}."
+            else:
+                text = "No derived task history found in this transcript."
+            self._safe_addnstr(stdscr, body_y, x, _fit(f"HISTORY LIST | {text}", w), w, curses.A_BOLD)
+            if body_y + 2 < y + h:
+                self._safe_addnstr(
+                    stdscr,
+                    body_y + 2,
+                    x,
+                    _fit("SELECTED EVENT | Nothing to display yet. Press [r] to reload after the session changes.", w),
+                    w,
+                    curses.A_BOLD,
+                )
             return
 
         selected_idx = min(len(events) - 1, self._history_selected_for(sv.meta.key))
         self._set_history_selected(sv.meta.key, selected_idx)
         expanded = self._history_expanded_for(sv.meta.key)
-        reserved_lines = 3 if expanded and events else 0
-        visible_events = max(1, (body_h - reserved_lines) // 2)
+        detail_h = 0
+        if body_h >= 8:
+            detail_h = max(4, body_h // 2 if expanded else max(5, body_h // 3))
+            detail_h = min(detail_h, max(4, body_h - 3))
+        list_h = max(2, body_h - detail_h - (1 if detail_h else 0))
+        visible_events = max(1, list_h - 1)
         scroll = self._history_scroll_for(sv.meta.key)
         limit = self._history_scroll_limit(len(events), visible_events)
         if scroll > limit:
@@ -1944,59 +2023,85 @@ class ClawMonitorTUI:
             self._set_history_scroll(sv.meta.key, scroll)
 
         shown = events[scroll : scroll + visible_events]
+        list_title = (
+            f"HISTORY LIST | items={len(events)}  selected={selected_idx + 1}/{len(events)}  "
+            f"window={self.history_range_days}d  [j/k] move  [PgUp/PgDn] page  [g/G] edge"
+        )
+        self._safe_addnstr(stdscr, body_y, x, _fit(list_title, w), w, curses.A_BOLD)
         for idx, event in enumerate(shown):
-            row_y = body_y + (idx * 2)
+            row_y = body_y + 1 + idx
             if row_y >= y + h:
                 break
             ts_text = _fmt_dt(event.ts)
-            label = event.kind.upper()
+            label = event.kind.upper()[:7]
             absolute_idx = scroll + idx
             prefix = ">" if absolute_idx == selected_idx else " "
-            line = f"{prefix} {ts_text}  [{label}]  {event.title}"
+            line = f"{prefix} {ts_text} | {label:<7} | {event.title}"
             live_attr = (live_now and absolute_idx == 0 and event.kind in ("working", "blocked")) or absolute_idx == selected_idx
             attr = self._history_kind_attr(event.kind, selected_live=live_attr)
             self._safe_addnstr(stdscr, row_y, x, _fit(line, w), w, attr)
-            if row_y + 1 < y + h:
-                self._safe_addnstr(stdscr, row_y + 1, x, _fit(f"  {event.summary}", w), w)
 
-        detail_y = body_y + max(1, len(shown) * 2)
-        if expanded and 0 <= selected_idx < len(events) and detail_y < y + h - 1:
+        detail_y = body_y + list_h
+        if detail_h > 0 and 0 <= selected_idx < len(events) and detail_y < y + h - 1:
+            try:
+                stdscr.hline(detail_y, x, curses.ACS_HLINE, max(0, w))
+            except curses.error:
+                pass
             selected = events[selected_idx]
+            section_title = (
+                f"SELECTED EVENT | {selected.kind.upper()} | "
+                f"{'expanded' if expanded else 'summary'} | [Enter] {'collapse' if expanded else 'expand'}"
+            )
             self._safe_addnstr(
                 stdscr,
-                detail_y,
+                detail_y + 1,
                 x,
-                _fit(f"Expanded [{selected.kind.upper()}]  Press [Enter] or [Space] to collapse.", w),
+                _fit(section_title, w),
                 w,
                 curses.A_BOLD | self._history_kind_attr(selected.kind),
             )
-            detail_lines = _wrap_lines(selected.summary, max(8, w - 2), max_lines=max(1, y + h - detail_y - 2))
-            for i, part in enumerate(detail_lines):
-                if detail_y + 1 + i >= y + h - 1:
+            meta_line = (
+                f"Time={_fmt_dt(selected.ts)} | Source={selected.source} | Confidence={selected.confidence} | Title={selected.title}"
+            )
+            self._safe_addnstr(stdscr, detail_y + 2, x, _fit(meta_line, w), w)
+            max_detail_lines = max(1, min(detail_h - 3, y + h - detail_y - 4))
+            summary_lines = _wrap_lines(selected.summary, max(8, w - 2), max_lines=max_detail_lines)
+            for i, part in enumerate(summary_lines):
+                line_y = detail_y + 3 + i
+                if line_y >= y + h - 1:
                     break
-                self._safe_addnstr(stdscr, detail_y + 1 + i, x, _fit(f"  {part}", w), w)
+                self._safe_addnstr(stdscr, line_y, x, _fit(f"  {part}", w), w)
 
         footer = (
             f"events={len(events)} sel={selected_idx + 1}/{len(events)} "
             f"scroll={scroll + 1}-{min(len(events), scroll + len(shown))}  "
-            f"j/k select  Enter expand  PgUp/PgDn page  g/G edge"
+            f"j/k select  Enter detail  PgUp/PgDn page  g/G edge"
         )
         self._safe_addnstr(stdscr, y + h - 1, x, _fit(footer, w), w)
 
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
         if not sv:
+            for j in range(h):
+                self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
+            title = "HISTORY DETAIL" if self.session_detail_mode == "history" else "STATUS DETAIL"
+            attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+            self._safe_addnstr(stdscr, y, x, _fit(f"{title} | Select a session on the left to populate this pane.", w), w, attr)
+            if h > 1:
+                hint = "[↑/↓] choose session  [h] toggle status/history  [z] show split panes  [Z] fullscreen detail"
+                self._safe_addnstr(stdscr, y + 1, x, _fit(hint, w), w)
             return
         if self.session_detail_mode == "history":
             self._draw_history_details(stdscr, x=x, y=y, h=h, w=w, sv=sv)
             return
+        banner = "STATUS DETAIL  [h] history  [z] panes  [Z] fullscreen  [b] bottom"
         if self.detail_fullscreen:
-            hint = "FULLSCREEN DETAIL ACTIVE  Press [Z] to return to split layout."
-            hint_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
-            self._safe_addnstr(stdscr, y, x, _fit(hint, w), w, hint_attr)
-            y += 1
-            h = max(0, h - 1)
-            if h <= 0:
-                return
+            banner += "  |  FULLSCREEN DETAIL ACTIVE"
+        hint_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        self._safe_addnstr(stdscr, y, x, _fit(banner, w), w, hint_attr)
+        y += 1
+        h = max(0, h - 1)
+        if h <= 0:
+            return
         rel_logs, last_activity = self._related_logs_cached(sv)
 
         log_budget = 0
@@ -2632,7 +2737,7 @@ class ClawMonitorTUI:
             "  PgUp/PgDn      Page through sessions (status view) or history (history view)",
             "  g / G          Jump to top / bottom (list or history)",
             "  j / k          Select previous / next history item",
-            "  double j / k   Jump to previous / next agent group",
+            "  double j / k   Jump to next agent / first session of previous agent",
             "  Esc            Return to default surface; press Esc again to quit",
             "  q              Quit immediately",
             "",
@@ -2652,7 +2757,7 @@ class ClawMonitorTUI:
             "  h              Toggle right-side Status / History detail mode",
             "  1 / 7          Set history range to 1 day / 7 days",
             "  b              Toggle bottom related logs panel",
-            "  Enter          Expand/collapse selected history item",
+            "  Enter          Expand/collapse the selected history detail block",
             "  d              Diagnose selected session (includes silent-gap hints)",
             "",
             "Tip:",
@@ -2964,7 +3069,7 @@ class ClawMonitorTUI:
                     continue
             h, _ = stdscr.getmaxyx()
             page_step = max(1, h - 6)
-            history_step = max(1, (h - 8) // 2)
+            history_step = max(1, h - 10)
             if ch == ord("q"):
                 return
             if ch == 27:
@@ -3070,6 +3175,8 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == ord("h") and self.view_mode == "sessions":
                 self.session_detail_mode = "history" if self.session_detail_mode == "status" else "status"
+                if self.session_detail_mode == "history" and not self.detail_fullscreen and self.pane_zoom_mode == "sessions":
+                    self.pane_zoom_mode = "detail"
                 dirty = True
             elif ch == ord("z") and self.view_mode == "sessions":
                 self._cycle_pane_zoom_mode()
@@ -3290,6 +3397,19 @@ class ClawMonitorTUI:
                 f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]refresh "
                 + (
                     (
+                        (
+                            f"[f]interval={int(self.refresh_seconds)}s "
+                            f"[h]{self.session_detail_mode} "
+                            f"[z]{self._pane_zoom_label()} "
+                            f"[Z]{'full' if self.detail_fullscreen else 'pane'} "
+                            f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                            f"[x]{'focus' if self.focus_mode else 'all'} "
+                            f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
+                            f"[1/7]historyRange={self.history_range_days}d "
+                            f"[R]rename [Enter]detail [e]export [b]bottom"
+                        )
+                        if self.session_detail_mode == "history"
+                        else
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
                         f"[z]{self._pane_zoom_label()} "
@@ -3309,10 +3429,14 @@ class ClawMonitorTUI:
             )
             footer_lines = [footer]
             if self.view_mode == "sessions":
+                if self.session_detail_mode == "history":
+                    tip = "tip=[j/k] history [Enter] detail [7] wider-window [r] reload [Esc] reset [jj/kk] agent jump"
+                else:
+                    tip = "tip=[h] history [b] bottom [z] panes [Z] fullscreen [Esc] reset [jj/kk] agent jump"
                 footer_lines.append(
                     f"detail={self.session_detail_mode} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[Esc] reset [z] panes [Z] right100 [?] help-again=full [jj/kk] agent jump"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  {tip}"
                 )
             else:
                 footer_lines.append(
