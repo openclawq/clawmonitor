@@ -788,6 +788,7 @@ class ClawMonitorTUI:
         self.session_detail_mode = "status"
         self.history_range_days = 1
         self.detail_zoom = False
+        self.detail_fullscreen = False
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
@@ -1766,17 +1767,20 @@ class ClawMonitorTUI:
 
         title = f"History  Range={self.history_range_days}d  State={status}  Cache={cache_mode}{elapsed}"
         self._safe_addnstr(stdscr, y, x, _fit(title, w), w, header_attr)
+        if self.detail_fullscreen:
+            self._safe_addnstr(stdscr, y + 1, x, _fit("FULLSCREEN DETAIL ACTIVE  Press [Z] to return to split layout.", w), w, curses.A_BOLD | header_attr)
         path_text = str(sv.meta.session_file) if sv.meta.session_file else "-"
-        self._safe_addnstr(stdscr, y + 1, x, _fit(f"Transcript: {path_text}", w), w)
+        path_y = y + (2 if self.detail_fullscreen else 1)
+        self._safe_addnstr(stdscr, path_y, x, _fit(f"Transcript: {path_text}", w), w)
         source_line = "Derived from transcript · best-effort"
         if live_now:
             source_line += " · LIVE TASK HISTORY"
         elif stale:
             source_line += " · Press [r] to refresh"
-        self._safe_addnstr(stdscr, y + 2, x, _fit(source_line, w), w)
+        self._safe_addnstr(stdscr, path_y + 1, x, _fit(source_line, w), w)
 
-        body_y = y + 4
-        body_h = max(0, h - 5)
+        body_y = path_y + 3
+        body_h = max(0, h - (body_y - y) - 1)
         if body_h <= 0:
             return
 
@@ -1830,6 +1834,14 @@ class ClawMonitorTUI:
         if self.session_detail_mode == "history":
             self._draw_history_details(stdscr, x=x, y=y, h=h, w=w, sv=sv)
             return
+        if self.detail_fullscreen:
+            hint = "FULLSCREEN DETAIL ACTIVE  Press [Z] to return to split layout."
+            hint_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+            self._safe_addnstr(stdscr, y, x, _fit(hint, w), w, hint_attr)
+            y += 1
+            h = max(0, h - 1)
+            if h <= 0:
+                return
         rel_logs, last_activity = self._related_logs_cached(sv)
 
         log_budget = 0
@@ -2449,8 +2461,16 @@ class ClawMonitorTUI:
                 self.elog.write("labels.write_failed", key=key, error=str(e))
 
     def _help_overlay(self, stdscr: "curses._CursesWindow") -> None:
-        lines = [
+        compact_lines = [
             "ClawMonitor TUI Help",
+            "",
+            "Top Actions:",
+            "  [?]            Help (press [?] again here for FULL help)",
+            "  z / Z          Zoom right pane / fullscreen detail",
+            "  h              Toggle Status / History",
+            "  r              Refresh, or load/reload History",
+            "  1 / 7          History range 1 day / 7 days",
+            "  b              Bottom panel toggle",
             "",
             "Navigation:",
             "  ↑/↓            Select session",
@@ -2465,6 +2485,7 @@ class ClawMonitorTUI:
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  z              Zoom right-side detail pane",
+            "  Z              Fullscreen detail pane",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
             "  n              Toggle NODE label mode (channel:label)",
@@ -2475,6 +2496,11 @@ class ClawMonitorTUI:
             "  1 / 7          Set history range to 1 day / 7 days",
             "  b              Toggle bottom related logs panel",
             "  d              Diagnose selected session (includes silent-gap hints)",
+            "",
+            "Tip:",
+            "  Press [?] again for FULL help. Press q or Esc to close.",
+        ]
+        full_only_lines = [
             "",
             "Model view:",
             "  - Manual refresh only. Press [r] to run model probes.",
@@ -2522,11 +2548,14 @@ class ClawMonitorTUI:
             "  PgUp/PgDn      Scroll page by page",
             "  g / G          Jump to start / end",
             "",
-            "Press q, Esc, Enter, or ? to close.",
+            "Tip:",
+            "  Press [?] again to return to COMPACT help. Press q or Esc to close.",
         ]
+        full_lines = compact_lines[:-3] + full_only_lines
+        show_full = False
 
         h, w = stdscr.getmaxyx()
-        win_h = min(max(12, len(lines) + 2), max(6, h - 4))
+        win_h = min(max(12, max(len(compact_lines), len(full_lines)) + 2), max(6, h - 4))
         win_w = min(92, max(20, w - 4))
         win_y = (h - win_h) // 2
         win_x = (w - win_w) // 2
@@ -2535,10 +2564,12 @@ class ClawMonitorTUI:
         win.timeout(-1)
         scroll = 0
         while True:
+            lines = full_lines if show_full else compact_lines
             win.clear()
             win.border()
             try:
-                title = f" Help  {scroll + 1}-{min(len(lines), scroll + (win_h - 2))}/{len(lines)} "
+                mode = "FULL" if show_full else "COMPACT"
+                title = f" Help {mode}  {scroll + 1}-{min(len(lines), scroll + (win_h - 2))}/{len(lines)} "
                 self._safe_addnstr(win, 0, 2, title, win_w - 4)
             except curses.error:
                 pass
@@ -2550,8 +2581,14 @@ class ClawMonitorTUI:
                     pass
             win.refresh()
             ch = win.getch()
-            if ch in (-1, 27, ord("q"), ord("?"), 10, 13):
+            if ch in (-1, 27, ord("q"), 10, 13):
                 return
+            if ch == ord("?"):
+                prev_show_full = show_full
+                show_full = not show_full
+                if prev_show_full != show_full:
+                    scroll = 0
+                continue
             if ch in (curses.KEY_UP, ord("k")):
                 scroll = max(0, scroll - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
@@ -2867,6 +2904,9 @@ class ClawMonitorTUI:
             elif ch == ord("z") and self.view_mode == "sessions":
                 self.detail_zoom = not self.detail_zoom
                 dirty = True
+            elif ch == ord("Z") and self.view_mode == "sessions":
+                self.detail_fullscreen = not self.detail_fullscreen
+                dirty = True
             elif ch == ord("1") and self.view_mode == "sessions":
                 self.history_range_days = 1
                 dirty = True
@@ -2955,7 +2995,9 @@ class ClawMonitorTUI:
                 content_y = 3
                 list_h = h - content_y - footer_h
             if self.view_mode == "sessions":
-                if self.detail_zoom:
+                if self.detail_fullscreen:
+                    list_w = 0
+                elif self.detail_zoom:
                     if self.session_detail_mode == "history":
                         list_w = max(22, min(30, max(22, int(w * 0.24))))
                     else:
@@ -2964,7 +3006,7 @@ class ClawMonitorTUI:
                     list_w = max(40, min(max(40, int(w * 0.46)), max(0, w - 28)))
             else:
                 list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
-            detail_w = w - list_w - 1
+            detail_w = w if (self.view_mode == "sessions" and self.detail_fullscreen) else (w - list_w - 1)
             warning_y = max(content_y, h - footer_h - 1)
             if self.view_mode == "models":
                 self._draw_model_list(stdscr, y=content_y, h=list_h, w=list_w, rows=model_rows)
@@ -2985,22 +3027,25 @@ class ClawMonitorTUI:
                     )
                 sv = None
             else:
-                self._draw_list(stdscr, y=content_y, h=list_h, w=list_w, items=items)
                 sv = self._selected_session(items)
-                if detail_w >= 24 and list_w < w - 1:
-                    try:
-                        stdscr.vline(content_y, list_w, curses.ACS_VLINE, max(0, h - content_y - 1))
-                    except curses.error:
-                        pass
-                    self._draw_details(stdscr, x=list_w + 1, y=content_y, h=h - content_y - 1, w=detail_w, sv=sv)
+                if self.detail_fullscreen:
+                    self._draw_details(stdscr, x=0, y=content_y, h=h - content_y - footer_h, w=w, sv=sv)
                 else:
-                    self._safe_addnstr(
-                        stdscr,
-                        warning_y,
-                        0,
-                        "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
-                        w,
-                    )
+                    self._draw_list(stdscr, y=content_y, h=list_h, w=list_w, items=items)
+                    if detail_w >= 24 and list_w < w - 1:
+                        try:
+                            stdscr.vline(content_y, list_w, curses.ACS_VLINE, max(0, h - content_y - footer_h))
+                        except curses.error:
+                            pass
+                        self._draw_details(stdscr, x=list_w + 1, y=content_y, h=h - content_y - footer_h, w=detail_w, sv=sv)
+                    else:
+                        self._safe_addnstr(
+                            stdscr,
+                            warning_y,
+                            0,
+                            "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
+                            w,
+                        )
 
             refresh_age = "-"
             if self.view_mode == "models":
@@ -3059,6 +3104,7 @@ class ClawMonitorTUI:
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
                         f"[z]{'zoom' if self.detail_zoom else 'split'} "
+                        f"[Z]{'full' if self.detail_fullscreen else 'pane'} "
                         f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
                         f"[x]{'focus' if self.focus_mode else 'all'} "
                         f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
@@ -3075,9 +3121,9 @@ class ClawMonitorTUI:
             footer_lines = [footer]
             if self.view_mode == "sessions":
                 footer_lines.append(
-                    f"detail={self.session_detail_mode} zoom={'on' if self.detail_zoom else 'off'} "
+                    f"detail={self.session_detail_mode} zoom={'on' if self.detail_zoom else 'off'} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[?] help, press [?] again for full"
                 )
             else:
                 footer_lines.append(
