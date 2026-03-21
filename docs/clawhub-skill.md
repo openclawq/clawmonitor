@@ -16,10 +16,12 @@ ClawHub can import skills directly from **public GitHub repos** and auto-detects
 
 ## What the skill does
 
-The `claw-monitor` skill is a wrapper that tells the agent how to use the `clawmonitor` CLI to:
+The `claw-monitor` skill is a wrapper that tells the agent how to use the `clawmonitor` CLI/TUI to:
 
 - render `clawmonitor status --format md` for IM-friendly updates
+- probe model health with `clawmonitor models`
 - export per-session diagnostics via `clawmonitor report`
+- inspect token usage windows and gateway service health through `clawmonitor tui`
 - optionally send progress nudges via `clawmonitor nudge`
 
 ## Notes
@@ -28,6 +30,5 @@ The `claw-monitor` skill is a wrapper that tells the agent how to use the `clawm
 - Make sure the host has `clawmonitor` installed:
 
 ```bash
-pip install clawmonitor
+pip install -U clawmonitor
 ```
-

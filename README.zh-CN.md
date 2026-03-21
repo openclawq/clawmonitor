@@ -2,10 +2,13 @@
 
 [English](README.md) | 简体中文
 
-用于 **OpenClaw** 的实时 Session/Thread 监控工具，核心能力：
+用于 **OpenClaw** 的键盘优先监控工具，核心能力：
 
 - 每个 Session 的最后一条 **user** / **assistant** 消息（预览 + 时间）
 - 每个模型的健康探测（直连 provider API + 走 OpenClaw 自身链路）
+- 按需读取 Session 历史任务轨迹（`todo / doing / done`）
+- Token 可见性：本地快照 + Gateway `1d / 7d / 30d` 区间统计
+- `openclaw-gateway.service` 的系统健康视角：cgroup、helper、zombie/orphan、可回收内存估算
 - 工作状态：`WORKING` / `FINISHED` / `INTERRUPTED` / `NO_MESSAGE`（并标记 `NO_FEEDBACK`）
 - 通过 `*.jsonl.lock` 识别长任务运行中状态（即使 Gateway 掉线也能判断）
 - 可选：Gateway 的 `logs.tail` + `channels.status` 关联（偏 Feishu/Telegram 的卡住类诊断）
@@ -86,7 +89,10 @@ clawmonitor watch --interval 1
 - `g` / `G`：跳到顶部 / 底部
 - `Enter`：对选中 session 发送 nudge（选择模板）
 - `?`：显示帮助说明
-- `v`：切换 Session / Model 视图
+- `v`：在 Session / Model / System 三个视图间轮转
+- `s`：直接进入 `System`
+- `h`：右侧切换 Status / History
+- `u`：切换 token 窗口（`now` / `1d` / `7d` / `30d`）
 - `x`：Focus 过滤（隐藏陈旧/不重要 session）
 - `t`：切换树形视图（按 agent 分组）
 - `c`：切换是否在树里显示 cron jobs
@@ -95,6 +101,10 @@ clawmonitor watch --interval 1
 - `l`：切换 Related Logs 面板
 - `d`：重新计算诊断（强制刷新）
 - `e`：导出该 session 的脱敏报告（JSON+MD）
+- `z`：循环切换 pane 宽度
+- `Z`：切换右侧详情全屏
+- `o`：在 `System` 视图打开 operator note
+- `Esc`：重置回默认界面
 - `r`：立即刷新
 - `f`：切换刷新间隔（最长 10 分钟）
 - `q`：退出
@@ -112,6 +122,14 @@ clawmonitor watch --interval 1
 - 目前已支持的直连 transport：`openai-completions`、`openai-responses`、`anthropic-messages`
 
 更多细节见：`docs/model-monitor.md`
+
+History / Token / System 说明：
+
+- History 默认按需读取；在 Session 视图按 `h` 后，再按 `r` 读取选中 session 的历史任务列表。
+- Token 的 `1d / 7d / 30d` 统计来自 Gateway，按需加载后会缓存。
+- `System` 视图只做观察，不会自动 kill / restart；它用于总结 service 状态、helper 堆积、zombie/orphan 和可回收内存估算。
+
+更多细节见：`docs/system-monitor.md`、`docs/system-view-guide.zh-CN.md`
 
 ## Telegram 说明：ACP 线程绑定（thread bindings）
 

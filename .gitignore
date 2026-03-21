@@ -9,3 +9,9 @@ build/
 
 # Local scratchpad (not committed)
 prgram/
+.factory/
+docs/clawmonitor-demo-*.cast
+docs/clawmonitor-formal-demo-*.cast
+docs/clawmonitor-formal-demo-*.gif
+docs/clawmonitor-formal-demo-*.mp4
+docs/clawmonitor-formal-demo-*.svg

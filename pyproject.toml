@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmonitor"
-version = "0.1.9"
-description = "OpenClaw session and model monitor (TUI/CLI) with Gateway correlation and manual progress nudges."
+version = "0.2.0"
+description = "Keyboard-first OpenClaw monitor for sessions, models, token usage, and gateway service health."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

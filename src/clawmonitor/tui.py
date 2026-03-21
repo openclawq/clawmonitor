@@ -58,7 +58,7 @@ from .channels_status import ChannelsSnapshot, fetch_channels_status
 from .config import Config
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .diagnostics import Evidence, Finding, diagnose, related_logs
-from .eventlog import EventLog
+from .eventlog import Event, EventLog, read_recent_events
 from .gateway_logs import GatewayLogTailer
 from .config import write_labels
 from .locks import LockInfo, lock_path_for_session_file, read_lock
@@ -73,6 +73,7 @@ from .session_store import SessionMeta, list_sessions
 from .session_history import SessionHistoryResult, TaskHistoryEvent, filter_history_events, history_is_stale, load_session_history
 from .session_usage import SessionUsageRangeEntry, SessionUsageRangeResult, fetch_sessions_usage_range, history_usage_is_stale
 from .state import SessionComputed, WorkState, WorkingSignal, compute_state
+from .system_monitor import SystemFamilySummary, SystemSnapshot, collect_system_snapshot
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
 
@@ -120,6 +121,41 @@ def _fmt_tokens_short(value: Optional[int]) -> str:
     else:
         text = f"{value / 1000000.0:.1f}m"
     return text.replace(".0k", "k").replace(".0m", "m")
+
+
+def _fmt_bytes_short(value: Optional[int]) -> str:
+    if value is None:
+        return "-"
+    size = max(0, int(value))
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f}K"
+    if size < 1024 * 1024 * 1024:
+        text = f"{size / (1024 * 1024):.1f}M"
+    else:
+        text = f"{size / (1024 * 1024 * 1024):.1f}G"
+    return text.replace(".0M", "M").replace(".0G", "G")
+
+
+def _fmt_kib_short(value: Optional[int]) -> str:
+    if value is None:
+        return "-"
+    return _fmt_bytes_short(int(value) * 1024)
+
+
+def _fmt_pct_short(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    try:
+        val = float(value)
+    except Exception:
+        return "-"
+    if abs(val) >= 100:
+        return f"{val:.0f}%"
+    if abs(val) >= 10:
+        return f"{val:.1f}%".replace(".0%", "%")
+    return f"{val:.1f}%".replace(".0%", "%")
 
 
 def _fmt_ratio_pct(numer: Optional[int], denom: Optional[int]) -> str:
@@ -462,6 +498,16 @@ class _HistoryPaneState:
 class _TokenUsagePaneState:
     load_state: str = "not_loaded"  # not_loaded | loading | ready | error
     result: Optional[SessionUsageRangeResult] = None
+    error: Optional[str] = None
+    progress_msg: str = ""
+    started_at: Optional[float] = None
+    last_loaded_at: Optional[float] = None
+
+
+@dataclass
+class _SystemPaneState:
+    load_state: str = "not_loaded"  # not_loaded | loading | ready | error
+    snapshot: Optional[SystemSnapshot] = None
     error: Optional[str] = None
     progress_msg: str = ""
     started_at: Optional[float] = None
@@ -819,6 +865,10 @@ class ClawMonitorTUI:
         self.model_selected = 0
         self.model_scroll = 0
         self.selected_model_key: Optional[str] = None
+        self.system_selected = 0
+        self.system_scroll = 0
+        self.selected_system_key: str = "__summary__"
+        self.system_pane_zoom_mode = "detail90"  # detail90 | even | left100 | detail100
         self.show_logs = True
         self.session_detail_mode = "status"
         self.session_metric_page = "activity"
@@ -843,6 +893,7 @@ class ClawMonitorTUI:
         self._color_idle = 0
         self._color_alert = 0
         self._color_magenta = 0
+        self._color_section = 0
         self._refresh_lock = threading.Lock()
         self._refresh_in_progress = False
         self._refresh_pending = False
@@ -868,6 +919,12 @@ class ClawMonitorTUI:
         self._history_scroll_by_key: Dict[str, int] = {}
         self._token_usage_lock = threading.Lock()
         self._token_usage_states: Dict[int, _TokenUsagePaneState] = {}
+        self._system_lock = threading.Lock()
+        self._system_state = _SystemPaneState()
+        self._system_last_request_manual = False
+        self._model_last_request_manual = False
+        self._event_cache_mtime: Optional[float] = None
+        self._event_cache_items: List[Event] = []
         self._last_total_sessions = 0
         self._last_shown_sessions = 0
 
@@ -924,8 +981,15 @@ class ClawMonitorTUI:
             self._model_refresh_in_progress = False
             self._model_refresh_error = err
             self._model_last_refresh_at = time.time()
+            manual = self._model_last_request_manual
+            self._model_last_request_manual = False
+        if manual:
+            if err:
+                self.elog.write("model.probe.error", error=err)
+            else:
+                self.elog.write("model.probe.ready", rows=len(self.model_monitor.rows))
 
-    def _request_model_refresh(self) -> None:
+    def _request_model_refresh(self, *, manual: bool = True) -> None:
         with self._model_refresh_lock:
             if self._model_refresh_in_progress:
                 return
@@ -935,8 +999,82 @@ class ClawMonitorTUI:
             self._model_refresh_progress_msg = "Refreshing model probes..."
             self._model_refresh_progress_step = 0
             self._model_refresh_progress_total = 0
+            self._model_last_request_manual = manual
+        if manual:
+            self.elog.write("model.probe.requested")
         t = threading.Thread(target=self._model_refresh_worker, name="clawmonitor-model-refresh", daemon=True)
         t.start()
+
+    def _system_snapshot(self) -> Optional[SystemSnapshot]:
+        with self._system_lock:
+            return self._system_state.snapshot
+
+    def _system_refresh_worker(self) -> None:
+        try:
+            snap = collect_system_snapshot()
+            err = None
+        except Exception as e:
+            snap = None
+            err = str(e)
+        with self._system_lock:
+            manual = self._system_last_request_manual
+            self._system_last_request_manual = False
+            if err is None and snap is not None:
+                self._system_state = _SystemPaneState(
+                    load_state="ready",
+                    snapshot=snap,
+                    progress_msg="systemctl + ps + /proc/cgroup",
+                    started_at=None,
+                    last_loaded_at=time.time(),
+                )
+            else:
+                prev = self._system_state.snapshot
+                self._system_state = _SystemPaneState(
+                    load_state="error",
+                    snapshot=prev,
+                    error=err or "system refresh failed",
+                    progress_msg="systemctl + ps + /proc/cgroup",
+                    started_at=None,
+                    last_loaded_at=self._system_state.last_loaded_at,
+                )
+        if manual:
+            if err is None and snap is not None:
+                self.elog.write(
+                    "system.refresh.ready",
+                    risk=snap.service_risk,
+                    reclaimableKiB=snap.reclaimable_kib,
+                    zombies=snap.zombie_count,
+                    problematic=snap.problematic_count,
+                )
+            else:
+                self.elog.write("system.refresh.error", error=err or "system refresh failed")
+
+    def _request_system_refresh(self, *, manual: bool = True) -> None:
+        with self._system_lock:
+            if self._system_state.load_state == "loading":
+                return
+            self._system_state = _SystemPaneState(
+                load_state="loading",
+                snapshot=self._system_state.snapshot,
+                error=None,
+                progress_msg="reading systemctl + ps + /proc cgroups",
+                started_at=time.time(),
+                last_loaded_at=self._system_state.last_loaded_at,
+            )
+            self._system_last_request_manual = manual
+        if manual:
+            self.elog.write("system.refresh.requested")
+        t = threading.Thread(target=self._system_refresh_worker, name="clawmonitor-system-refresh", daemon=True)
+        t.start()
+
+    def _maybe_request_system_refresh(self) -> None:
+        with self._system_lock:
+            state = self._system_state
+            if state.load_state == "loading":
+                return
+            if state.last_loaded_at is not None and (time.time() - state.last_loaded_at) < max(2.0, float(self.refresh_seconds)):
+                return
+        self._request_system_refresh(manual=False)
 
     def _history_state_for(self, session_key: str) -> _HistoryPaneState:
         with self._history_lock:
@@ -985,6 +1123,7 @@ class ClawMonitorTUI:
                     started_at=None,
                     last_loaded_at=time.time(),
                 )
+                self.elog.write("history.load.ready", sessionKey=session_key, mode=result.mode, events=len(result.events))
             else:
                 prev = self._history_states.get(session_key)
                 self._history_states[session_key] = _HistoryPaneState(
@@ -995,6 +1134,7 @@ class ClawMonitorTUI:
                     started_at=None,
                     last_loaded_at=prev.last_loaded_at if prev else None,
                 )
+                self.elog.write("history.load.error", sessionKey=session_key, error=err or "history load failed")
 
     def _request_history_load(self, sv: SessionView) -> None:
         if not sv.meta.session_file:
@@ -1007,6 +1147,7 @@ class ClawMonitorTUI:
                     started_at=None,
                     last_loaded_at=None,
                 )
+            self.elog.write("history.load.error", sessionKey=sv.meta.key, error="session has no transcript file")
             return
         with self._history_lock:
             cur = self._history_states.get(sv.meta.key)
@@ -1020,6 +1161,7 @@ class ClawMonitorTUI:
                 started_at=time.time(),
                 last_loaded_at=cur.last_loaded_at if cur else None,
             )
+        self.elog.write("history.load.requested", sessionKey=sv.meta.key, sessionId=sv.meta.session_id)
         t = threading.Thread(
             target=self._history_worker,
             args=(sv.meta.key, sv.meta.session_id, sv.meta.session_file),
@@ -1055,6 +1197,7 @@ class ClawMonitorTUI:
                     started_at=None,
                     last_loaded_at=time.time(),
                 )
+                self.elog.write("token.load.ready", days=days, sessions=len(result.sessions_by_key))
             else:
                 self._token_usage_states[days] = _TokenUsagePaneState(
                     load_state="error",
@@ -1064,6 +1207,7 @@ class ClawMonitorTUI:
                     started_at=None,
                     last_loaded_at=prev.last_loaded_at if prev else None,
                 )
+                self.elog.write("token.load.error", days=days, error=err or "usage load failed")
 
     def _request_token_usage_load(self, days: int) -> None:
         if days <= 0:
@@ -1080,6 +1224,7 @@ class ClawMonitorTUI:
                 started_at=time.time(),
                 last_loaded_at=cur.last_loaded_at if cur else None,
             )
+        self.elog.write("token.load.requested", days=days)
         t = threading.Thread(
             target=self._token_usage_worker,
             args=(days,),
@@ -1129,6 +1274,44 @@ class ClawMonitorTUI:
         self._rel_cache_lines = rel_lines
         self._rel_cache_last_activity = last_activity
         return rel_lines, last_activity
+
+    def _recent_monitor_events(self, *, limit: int = 8) -> List[Event]:
+        path = self.elog.path
+        try:
+            st = path.stat()
+            mtime = st.st_mtime
+        except Exception:
+            self._event_cache_mtime = None
+            self._event_cache_items = []
+            return []
+        if self._event_cache_mtime != mtime:
+            self._event_cache_items = read_recent_events(path, limit=max(20, limit))
+            self._event_cache_mtime = mtime
+        return list(self._event_cache_items[:limit])
+
+    def _format_monitor_event(self, event: Event) -> str:
+        ts = event.ts
+        try:
+            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            ts_text = ts_dt.astimezone().strftime("%H:%M:%S")
+        except Exception:
+            ts_text = ts[:8]
+        label = (event.event or "").replace(".", " ")
+        data = event.data or {}
+        detail = ""
+        if "sessionKey" in data:
+            detail = _tail_suffix(str(data.get("sessionKey") or ""), n=6)
+        elif "days" in data:
+            detail = f"{data.get('days')}d"
+        elif "rows" in data:
+            detail = f"rows={data.get('rows')}"
+        elif "risk" in data:
+            detail = f"risk={data.get('risk')}"
+        elif "error" in data:
+            detail = str(data.get("error") or "")[:36]
+        if detail:
+            return f"{ts_text}  {label}  {detail}"
+        return f"{ts_text}  {label}"
 
     def _agent_kind(self, agent_id: str) -> str:
         snap = self.model.config_snapshot
@@ -1401,6 +1584,49 @@ class ClawMonitorTUI:
         self.model_selected = len(rows) - 1 if end else 0
         self.selected_model_key = self._model_key(rows[self.model_selected])
 
+    def _system_row_keys(self, snapshot: Optional[SystemSnapshot]) -> List[str]:
+        if snapshot is None:
+            return ["__summary__"]
+        return ["__summary__"] + [row.family for row in snapshot.families]
+
+    def _selected_system_family(self, snapshot: Optional[SystemSnapshot]) -> Optional[SystemFamilySummary]:
+        if snapshot is None:
+            return None
+        rows = list(snapshot.families)
+        if self.system_selected <= 0:
+            return None
+        idx = self.system_selected - 1
+        if idx < 0 or idx >= len(rows):
+            return None
+        return rows[idx]
+
+    def _reconcile_system_selection(self, snapshot: Optional[SystemSnapshot]) -> None:
+        keys = self._system_row_keys(snapshot)
+        if not keys:
+            self.system_selected = 0
+            self.system_scroll = 0
+            self.selected_system_key = "__summary__"
+            return
+        if self.selected_system_key in keys:
+            self.system_selected = keys.index(self.selected_system_key)
+        else:
+            self.system_selected = min(max(0, self.system_selected), len(keys) - 1)
+            self.selected_system_key = keys[self.system_selected]
+
+    def _move_system_selection(self, snapshot: Optional[SystemSnapshot], delta: int) -> None:
+        keys = self._system_row_keys(snapshot)
+        if not keys:
+            return
+        self.system_selected = max(0, min(len(keys) - 1, self.system_selected + delta))
+        self.selected_system_key = keys[self.system_selected]
+
+    def _move_system_to_edge(self, snapshot: Optional[SystemSnapshot], *, end: bool) -> None:
+        keys = self._system_row_keys(snapshot)
+        if not keys:
+            return
+        self.system_selected = len(keys) - 1 if end else 0
+        self.selected_system_key = keys[self.system_selected]
+
     def _row_attr(self, health_cls: str, *, selected: bool) -> int:
         attr = curses.A_NORMAL
         if self._colors_enabled:
@@ -1446,6 +1672,48 @@ class ClawMonitorTUI:
                 stdscr.addnstr(y, x, text, maxw)
         except curses.error:
             return
+
+    def _safe_add_segments(
+        self,
+        stdscr: "curses._CursesWindow",
+        y: int,
+        x: int,
+        segments: List[Tuple[str, int]],
+        width: int,
+        *,
+        pad_attr: int = 0,
+    ) -> None:
+        if width <= 0:
+            return
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        maxw = min(width, max(0, w - x - 2))
+        if maxw <= 0:
+            return
+        cur_x = x
+        remaining = maxw
+        for raw_text, attr in segments:
+            if remaining <= 0:
+                break
+            text = _sanitize_for_curses(raw_text)
+            if not text:
+                continue
+            clipped = _truncate_cells(text, remaining)
+            if not clipped:
+                continue
+            try:
+                if attr:
+                    stdscr.addnstr(y, cur_x, clipped, len(clipped), attr)
+                else:
+                    stdscr.addnstr(y, cur_x, clipped, len(clipped))
+            except curses.error:
+                break
+            seg_w = _display_width(clipped)
+            cur_x += seg_w
+            remaining -= seg_w
+        if remaining > 0:
+            self._safe_addnstr(stdscr, y, cur_x, " " * remaining, remaining, pad_attr)
 
     def _draw_loading(
         self,
@@ -1496,12 +1764,399 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, h - 1, 2, "Tip: later you can press [r] to refresh and [?] for help.", max(0, w - 4))
         stdscr.refresh()
 
+    def _view_label(self) -> str:
+        return {
+            "sessions": "Sessions",
+            "models": "Models",
+            "system": "System",
+        }.get(self.view_mode, self.view_mode.title())
+
+    def _risk_attr(self, risk: str, *, selected: bool = False, loading: bool = False) -> int:
+        health_cls = "ok"
+        if loading:
+            health_cls = "working"
+        elif risk == "alert":
+            health_cls = "alert"
+        elif risk == "warn":
+            health_cls = "idle"
+        return self._row_attr(health_cls, selected=selected)
+
+    def _section_attr(self, name: str, *, risk: Optional[str] = None, active: bool = False) -> int:
+        attr = curses.A_BOLD
+        if active:
+            attr |= self._color_working if self._colors_enabled else 0
+            return attr
+        if risk == "alert":
+            attr |= self._color_alert if self._colors_enabled else 0
+            return attr
+        if risk == "warn":
+            attr |= self._color_idle if self._colors_enabled else 0
+            return attr
+        label = (name or "").upper()
+        if label in ("SERVICE", "PROCESS DETAIL", "STATUS", "DIRECT PROBE:", "OPENCLAW PROBE:"):
+            attr |= self._color_working if self._colors_enabled else 0
+        elif label in ("ISSUES", "ERRORS"):
+            attr |= self._color_alert if self._colors_enabled else 0
+        elif label in ("MONITOR EVENTS", "SELECTED EVENT", "HISTORY DETAIL"):
+            attr |= self._color_magenta if self._colors_enabled else 0
+        elif label in ("RESOURCES", "COUNTS", "TOKEN", "USAGE", "MODEL VIEW", "SYSTEM ABBREVIATIONS"):
+            attr |= self._color_section if self._colors_enabled else 0
+        else:
+            attr |= self._color_section if self._colors_enabled else 0
+        return attr
+
+    def _monitor_event_attr(self, event_name: str) -> int:
+        event = (event_name or "").strip().lower()
+        attr = 0
+        if event.endswith(".error") or event.startswith("labels.write_failed"):
+            attr |= self._color_alert if self._colors_enabled else 0
+        elif event.endswith(".ready") or event.endswith(".result"):
+            attr |= self._color_ok if self._colors_enabled else 0
+        elif event.endswith(".requested"):
+            attr |= self._color_working if self._colors_enabled else 0
+        elif event.startswith(("nudge.", "labels.", "report.")):
+            attr |= self._color_magenta if self._colors_enabled else 0
+        elif event.startswith(("history.", "token.", "model.", "system.")):
+            attr |= self._color_section if self._colors_enabled else 0
+        return attr
+
+    def _semantic_attr(self, level: str, *, badge: bool = False) -> int:
+        attr = curses.A_BOLD
+        key = (level or "").strip().lower()
+        if key in ("ok", "ready", "healthy", "done", "success"):
+            attr |= self._color_ok if self._colors_enabled else 0
+        elif key in ("working", "loading", "running", "active", "progress"):
+            attr |= self._color_working if self._colors_enabled else 0
+        elif key in ("warn", "waiting", "stale", "degraded", "unknown"):
+            attr |= self._color_idle if self._colors_enabled else 0
+        elif key in ("alert", "error", "down", "failed"):
+            attr |= self._color_alert if self._colors_enabled else 0
+        elif key in ("action", "history", "event"):
+            attr |= self._color_magenta if self._colors_enabled else 0
+        else:
+            attr |= self._color_section if self._colors_enabled else 0
+        if badge:
+            attr |= curses.A_REVERSE
+        return attr
+
+    def _selected_attr(self, attr: int, *, selected: bool) -> int:
+        if selected:
+            return attr | curses.A_REVERSE | curses.A_BOLD
+        return attr
+
+    def _attention_attr(self, level: str, *, selected: bool = False, badge: bool = False) -> int:
+        attr = self._semantic_attr(level, badge=badge)
+        key = (level or "").strip().lower()
+        if key in ("alert", "error", "failed", "down"):
+            attr |= curses.A_STANDOUT
+        elif key in ("warn", "stale", "degraded") and not badge:
+            attr |= curses.A_BOLD
+        return self._selected_attr(attr, selected=selected)
+
+    def _footer_badge(self, label: str, level: str) -> List[Tuple[str, int]]:
+        return [
+            (" ", 0),
+            (f" {label} ", self._semantic_attr(level, badge=True)),
+            (" ", 0),
+        ]
+
+    def _system_reclaim_level(self, reclaimable_kib: int) -> str:
+        if reclaimable_kib >= 1024 * 1024:
+            return "alert"
+        if reclaimable_kib >= 256 * 1024:
+            return "warn"
+        return "ok"
+
+    def _system_problem_level(self, count: int) -> str:
+        if count >= 5:
+            return "alert"
+        if count > 0:
+            return "warn"
+        return "ok"
+
+    def _system_zombie_level(self, count: int) -> str:
+        if count >= 3:
+            return "alert"
+        if count > 0:
+            return "warn"
+        return "ok"
+
+    def _system_orphan_level(self, count: int) -> str:
+        return "alert" if count > 0 else "ok"
+
+    def _system_helper_level(self, count: int) -> str:
+        if count >= 12:
+            return "warn"
+        return "ok"
+
+    def _session_run_level(self, seconds: Optional[int]) -> str:
+        if seconds is None:
+            return "ok"
+        if seconds >= 30 * 60:
+            return "alert"
+        if seconds >= 10 * 60:
+            return "warn"
+        return "working"
+
+    def _session_idle_level(self, seconds: Optional[int]) -> str:
+        if seconds is None:
+            return "ok"
+        if seconds >= 24 * 3600:
+            return "warn"
+        return "ok"
+
+    def _session_state_cell_attr(self, sv: SessionView, health_cls: str, *, selected: bool) -> int:
+        state = (sv.computed.state.value or "").strip().upper()
+        if state == "WORKING":
+            return self._attention_attr("working", selected=selected)
+        if state == "FINISHED":
+            return self._attention_attr("ok", selected=selected)
+        if state in ("NO_MESSAGE", "NOMSG"):
+            return self._attention_attr("warn", selected=selected)
+        if health_cls == "alert":
+            return self._attention_attr("alert", selected=selected)
+        return self._selected_attr(self._row_attr(health_cls, selected=False), selected=selected)
+
+    def _session_flag_attr(self, flag_str: str, health_cls: str, *, selected: bool) -> int:
+        upper = (flag_str or "").upper()
+        if any(token in upper for token in ("NOFB", "DLV", "ZLOCK", "SAFE", "TRXM")):
+            return self._attention_attr("alert", selected=selected)
+        if "RUN" in upper or "ACPRUN" in upper:
+            return self._attention_attr("working", selected=selected)
+        if health_cls == "idle":
+            return self._attention_attr("warn", selected=selected)
+        return self._attention_attr("ok", selected=selected)
+
+    def _token_volume_level(self, value: Optional[int]) -> str:
+        if value is None:
+            return "ok"
+        if value >= 2_000_000:
+            return "alert"
+        if value >= 500_000:
+            return "warn"
+        return "ok"
+
+    def _context_level(self, numer: Optional[int], denom: Optional[int]) -> str:
+        if numer is None or denom is None or denom <= 0:
+            return "ok"
+        pct = (numer / denom) * 100.0
+        if pct >= 95:
+            return "alert"
+        if pct >= 80:
+            return "warn"
+        return "ok"
+
+    def _probe_cell_attr(self, probe: Optional[object], *, selected: bool) -> int:
+        if probe is None:
+            return self._selected_attr(curses.A_DIM, selected=selected)
+        status = getattr(probe, "status", "")
+        latency = getattr(probe, "latency_ms", None)
+        if status == "ok":
+            if latency is not None and latency >= 15000:
+                return self._attention_attr("alert", selected=selected)
+            if latency is not None and latency >= 5000:
+                return self._attention_attr("warn", selected=selected)
+            return self._attention_attr("ok", selected=selected)
+        return self._attention_attr(status, selected=selected)
+
+    def _service_state_attr(self, active_state: str, sub_state: str) -> int:
+        state = f"{active_state}/{sub_state}".strip("/").lower()
+        if state in ("active/running", "running", "active"):
+            return curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        if any(token in state for token in ("activating", "reloading", "reload", "starting")):
+            return curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        if any(token in state for token in ("failed", "dead", "deactivating", "inactive", "exited")):
+            return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+
+    def _model_status_attr(self, status: str, *, selected: bool = False) -> int:
+        value = (status or "").strip().lower()
+        if value == "ok":
+            return self._row_attr("ok", selected=selected)
+        if value in ("degraded", "timeout", "rate_limit", "overloaded", "unsupported", "unknown"):
+            return self._row_attr("idle", selected=selected)
+        if value in ("running", "loading", "probing", "active"):
+            return self._row_attr("working", selected=selected)
+        return self._row_attr("alert", selected=selected)
+
+    def _probe_status_attr(self, status: str) -> int:
+        return curses.A_BOLD | self._model_status_attr(status)
+
+    def _session_status_line_attr(self, line: str) -> int:
+        lower = (line or "").lower()
+        if line.startswith(("Task:", "Thinking:", "Trigger:", "Activity:")):
+            return self._color_magenta if self._colors_enabled else 0
+        if line.startswith("ToolCall:"):
+            return curses.A_BOLD | (self._color_magenta if self._colors_enabled else 0)
+        if line.startswith("ToolResult:"):
+            if " err " in lower or lower.endswith(" err"):
+                return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+            return curses.A_BOLD | (self._color_magenta if self._colors_enabled else 0)
+        if line.startswith("Last tool error:"):
+            return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        if line.startswith(("Token:", "Context:", "Usage ", "UsageCost ")):
+            return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        if line.startswith("State:"):
+            if "working" in lower or "running" in lower:
+                return curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+            if "finished" in lower or "done" in lower:
+                return curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+            if "no_message" in lower or "nomsg" in lower:
+                return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+            return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        if line.startswith("Transcript:"):
+            if "missing" in lower:
+                return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+            if "ok" in lower:
+                return curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        if line.startswith(("Work:", "ACPX:")):
+            return curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        if line.startswith("Lock:"):
+            if "alive=false" in lower:
+                return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+            if "alive=true" in lower:
+                return curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        if line.startswith("Delivery FAILED:") or line.startswith("Alerts:"):
+            return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        if line.startswith("Telegram Binding:"):
+            return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        if line.startswith("Diagnosis:"):
+            if not self._colors_enabled:
+                return curses.A_BOLD
+            if "(none)" in lower:
+                return curses.A_BOLD | self._color_ok
+            if "[info]" in lower:
+                return curses.A_BOLD | self._color_idle
+            return curses.A_BOLD | self._color_alert
+        return 0
+
+    def _visible_status_lines(self, lines: List[str], max_lines: int) -> List[str]:
+        if max_lines <= 0 or len(lines) <= max_lines:
+            return lines[:max_lines] if max_lines > 0 else []
+        head_n = min(5, max(1, max_lines - 3))
+        tail_n = max(1, max_lines - head_n - 1)
+        return lines[:head_n] + ["…"] + lines[-tail_n:]
+
+    def _build_session_status_lines(
+        self,
+        sv: SessionView,
+        *,
+        last_activity: Optional[str],
+        width: int,
+    ) -> List[str]:
+        markers = _agent_markers(sv.meta, self.model.config_snapshot)
+        mark_str = f" ({','.join(markers)})" if markers else ""
+        key_info = parse_session_key(sv.meta.key)
+        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
+        status_lines: List[str] = [
+            f"SessionKey: {sv.meta.key}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
+            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
+            f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
+        ]
+        status_lines.extend(self._session_usage_lines(sv))
+        status_lines.extend(self._session_range_usage_lines(sv))
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
+        if sv.tail.last_entry_type:
+            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
+        if sv.acpx and sv.meta.acpx_session_id:
+            st = sv.meta.acp_state or "-"
+            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
+            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
+        if sv.working and not sv.lock:
+            status_lines.append(f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}")
+        if sv.lock:
+            task_src = sv.tail.last_user_send
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, width), max_lines=2)[:2])
+            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
+                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, width), max_lines=2)[:2])
+        elif sv.working:
+            task_src = sv.tail.last_user_send or sv.tail.last_trigger
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, width), max_lines=2)[:2])
+        if (sv.lock or sv.working) and sv.tail.last_assistant_thinking:
+            think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, width), max_lines=2)
+            status_lines.extend(think_lines[:2])
+        if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
+            names = ",".join(sv.tail.last_tool_call.tool_names[:3])
+            status_lines.append(f"ToolCall: {names}")
+        if sv.tail.last_tool_result:
+            tr = sv.tail.last_tool_result
+            ok = "err" if tr.is_error else "ok"
+            status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
+        if sv.tail.last_tool_error:
+            ts, summary = sv.tail.last_tool_error
+            status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+        if (sv.lock or sv.working) and last_activity:
+            status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, width), max_lines=1)[:1])
+        acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
+        if acct_info:
+            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
+            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
+            status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
+        if sv.human_out_at:
+            status_lines.append(f"HumanOut: @ {_fmt_dt(sv.human_out_at)}  age={_fmt_age(_age_seconds(sv.human_out_at)).strip()}")
+        else:
+            status_lines.append("HumanOut: -")
+        if sv.internal_activity_at:
+            status_lines.append(f"Internal: @ {_fmt_dt(sv.internal_activity_at)}  age={_fmt_age(_age_seconds(sv.internal_activity_at)).strip()}")
+        else:
+            status_lines.append("Internal: -")
+        if sv.telegram_binding:
+            b = sv.telegram_binding
+            note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
+            status_lines.append(
+                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
+            )
+        if sv.lock:
+            status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
+        else:
+            status_lines.append("Lock: -")
+        if sv.delivery_failure:
+            status_lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
+        alerts: List[str] = []
+        if sv.computed.no_feedback:
+            alerts.append("NO_FEEDBACK")
+        if sv.computed.safety_alert:
+            alerts.append("SAFETY")
+        if sv.computed.safeguard_alert:
+            alerts.append("SAFEGUARD_OFF")
+        if alerts:
+            status_lines.append("Alerts: " + ",".join(alerts))
+        if sv.findings:
+            status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
+        else:
+            status_lines.append("Diagnosis: (none)")
+        return status_lines
+
+    def _cycle_system_pane_zoom_mode(self) -> None:
+        order = ["detail90", "even", "left100", "detail100"]
+        try:
+            idx = order.index(self.system_pane_zoom_mode)
+        except ValueError:
+            idx = 0
+        self.system_pane_zoom_mode = order[(idx + 1) % len(order)]
+
+    def _system_pane_zoom_label(self) -> str:
+        return {
+            "detail90": "10/90",
+            "even": "50/50",
+            "left100": "left100",
+            "detail100": "right100",
+        }.get(self.system_pane_zoom_mode, "10/90")
+
     def _draw_header(self, stdscr: "curses._CursesWindow", width: int) -> None:
         channels = self.model.channels
         mode = "online" if self.model.gateway_log_tailer.available else "offline"
-        view = "Models" if self.view_mode == "models" else "Sessions"
         head = (
-            f"ClawMonitor  |  View: {view}  |  OpenClaw: {self.cfg.openclaw_root}  |  "
+            f"ClawMonitor  |  View: {self._view_label()}  |  OpenClaw: {self.cfg.openclaw_root}  |  "
             f"Gateway: {mode}  |  {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         self._safe_addnstr(stdscr, 0, 0, head.ljust(width), width, curses.A_REVERSE)
@@ -1511,6 +2166,8 @@ class ClawMonitorTUI:
                 "  |  Legend: USER=last user idle  ASST=last assistant idle  RUN=active run duration"
                 f"  |  Cols: {self._session_metric_page_label()}"
             )
+        elif self.view_mode == "system":
+            legend = "  |  Legend: RSS=resident memory  RECL=potential reclaimable estimate  Z=zombies  ORPH=orphans"
         if channels and isinstance(channels.raw.get("channelOrder"), list):
             chan_names = ", ".join([str(x) for x in channels.raw.get("channelOrder", [])])
             self._safe_addnstr(stdscr, 1, 0, f"Channels: {chan_names}{legend}".ljust(width), width)
@@ -1577,6 +2234,231 @@ class ClawMonitorTUI:
         else:
             attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
         return text, attr
+
+    def _system_banner(self) -> Tuple[str, int]:
+        with self._system_lock:
+            state = self._system_state
+        elapsed = ""
+        if state.load_state == "loading" and state.started_at is not None:
+            elapsed = f" elapsed={int(max(0.0, time.time() - state.started_at))}s"
+        if state.load_state == "loading":
+            text = f"SYSTEM SNAPSHOT: LOADING{elapsed}  {state.progress_msg or 'reading systemctl + ps + /proc cgroups'}"
+            return text, curses.A_BOLD | self._risk_attr("ok", loading=True)
+        if state.load_state == "error":
+            snap = state.snapshot
+            if snap is not None:
+                sample_age = "-"
+                if state.last_loaded_at is not None:
+                    sample_age = _fmt_age(int(max(0.0, time.time() - state.last_loaded_at))).strip()
+                text = (
+                    f"SYSTEM SNAPSHOT: ERROR  {state.error or 'refresh failed'}  "
+                    f"using last snapshot age={sample_age} reclaim~{_fmt_kib_short(snap.reclaimable_kib)}"
+                )
+                return text, curses.A_BOLD | self._risk_attr("alert")
+            return f"SYSTEM SNAPSHOT: ERROR  {state.error or 'refresh failed'}", curses.A_BOLD | self._risk_attr("alert")
+        if state.snapshot is not None:
+            snap = state.snapshot
+            sample_age = "-"
+            if state.last_loaded_at is not None:
+                sample_age = _fmt_age(int(max(0.0, time.time() - state.last_loaded_at))).strip()
+            risk = snap.service_risk
+            text = (
+                f"SYSTEM SNAPSHOT: READY  sampleAge={sample_age}  "
+                f"reclaim~{_fmt_kib_short(snap.reclaimable_kib)}  zombies={snap.zombie_count}  "
+                f"helpers={snap.helper_process_count}  risk={risk.upper()}"
+            )
+            return text, curses.A_BOLD | self._risk_attr(risk)
+        return (
+            "SYSTEM SNAPSHOT: WAITING  Press [r] to inspect service/cgroup state, or wait for auto refresh.",
+            curses.A_BOLD | self._risk_attr("warn"),
+        )
+
+    def _system_subbanner_segments(self) -> List[Tuple[str, int]]:
+        snap = self._system_snapshot()
+        label_attr = self._section_attr("SYSTEM ABBREVIATIONS")
+        shortcut_attr = curses.A_BOLD | (self._color_magenta if self._colors_enabled else 0)
+        normal_attr = curses.A_BOLD
+        if snap is None:
+            return [
+                ("Cols: ", label_attr),
+                ("FAMILY", label_attr),
+                ("=process group  ", normal_attr),
+                ("RISK", label_attr),
+                ("=OK/WARN/ALERT  ", normal_attr),
+                ("PROC", label_attr),
+                ("=count  ", normal_attr),
+                ("RSS", label_attr),
+                ("=live RSS  ", normal_attr),
+                ("Z", label_attr),
+                ("=zombies  ", normal_attr),
+                ("ORPH", label_attr),
+                ("=ppid=1  ", normal_attr),
+                ("RECL", label_attr),
+                ("=estimated reclaimable  ", normal_attr),
+                ("[z]", shortcut_attr),
+                (f"={self._system_pane_zoom_label()}", curses.A_BOLD | (self._color_working if self._colors_enabled else 0)),
+            ]
+        svc_attr = self._service_state_attr(snap.service.active_state, snap.service.sub_state)
+        kill_mode_attr = self._risk_attr("ok" if (snap.service.kill_mode or "").strip() == "control-group" else "warn")
+        prob_risk = self._system_problem_level(snap.problematic_count)
+        reclaim_risk = self._system_reclaim_level(snap.reclaimable_kib)
+        return [
+            ("Svc", label_attr),
+            ("=", normal_attr),
+            (f"{snap.service.active_state}/{snap.service.sub_state}", svc_attr),
+            ("  KillMode", label_attr),
+            ("=", normal_attr),
+            (f"{snap.service.kill_mode}", curses.A_BOLD | kill_mode_attr),
+            ("  MainPID", label_attr),
+            ("=", normal_attr),
+            (f"{snap.service.main_pid or '-'}", normal_attr),
+            ("  Tasks", label_attr),
+            ("=", normal_attr),
+            (f"{snap.service.tasks_current or '-'}", normal_attr),
+            ("  Mem", label_attr),
+            ("=", normal_attr),
+            (f"{_fmt_bytes_short(snap.service.memory_current_bytes)}", normal_attr),
+            ("  Procs", label_attr),
+            ("=", normal_attr),
+            (f"{snap.cgroup_process_count}", normal_attr),
+            ("  Prob", label_attr),
+            ("=", normal_attr),
+            (f"{snap.problematic_count}", self._semantic_attr(prob_risk, badge=(prob_risk == "alert"))),
+            ("  Reclaim~", label_attr),
+            ("=", normal_attr),
+            (f"{_fmt_kib_short(snap.reclaimable_kib)}", self._semantic_attr(reclaim_risk, badge=(reclaim_risk == "alert"))),
+            ("  [z]", shortcut_attr),
+            ("=", normal_attr),
+            (f"{self._system_pane_zoom_label()}", curses.A_BOLD | (self._color_working if self._colors_enabled else 0)),
+        ]
+
+    def _system_service_line_segments(self, snapshot: SystemSnapshot, *, sample_age: str) -> List[Tuple[str, int]]:
+        label_attr = self._section_attr("SERVICE")
+        normal_attr = curses.A_BOLD
+        return [
+            ("Unit", label_attr),
+            ("=", normal_attr),
+            (snapshot.service.unit_name, normal_attr),
+            ("  state", label_attr),
+            ("=", normal_attr),
+            (f"{snapshot.service.active_state}/{snapshot.service.sub_state}", self._service_state_attr(snapshot.service.active_state, snapshot.service.sub_state)),
+            ("  KillMode", label_attr),
+            ("=", normal_attr),
+            (snapshot.service.kill_mode or "-", self._semantic_attr("ok" if (snapshot.service.kill_mode or "").strip() == "control-group" else "warn", badge=((snapshot.service.kill_mode or "").strip() != "control-group"))),
+            ("  risk", label_attr),
+            ("=", normal_attr),
+            (snapshot.service_risk.upper(), self._semantic_attr(snapshot.service_risk, badge=(snapshot.service_risk == "alert"))),
+            ("  sampleAge", label_attr),
+            ("=", normal_attr),
+            (sample_age, normal_attr),
+        ]
+
+    def _system_counts_line_segments(self, snapshot: SystemSnapshot) -> List[Tuple[str, int]]:
+        label_attr = self._section_attr("COUNTS")
+        normal_attr = curses.A_BOLD
+        helper_level = self._system_helper_level(snapshot.helper_process_count)
+        zombie_level = self._system_zombie_level(snapshot.zombie_count)
+        orphan_level = self._system_orphan_level(snapshot.orphan_count)
+        problem_level = self._system_problem_level(snapshot.problematic_count)
+        reclaim_level = self._system_reclaim_level(snapshot.reclaimable_kib)
+        return [
+            ("procs", label_attr),
+            ("=", normal_attr),
+            (str(snapshot.cgroup_process_count), normal_attr),
+            ("  helpers", label_attr),
+            ("=", normal_attr),
+            (str(snapshot.helper_process_count), self._attention_attr(helper_level, badge=(helper_level == "alert"))),
+            ("  zombies", label_attr),
+            ("=", normal_attr),
+            (str(snapshot.zombie_count), self._attention_attr(zombie_level, badge=(zombie_level == "alert"))),
+            ("  orphans", label_attr),
+            ("=", normal_attr),
+            (str(snapshot.orphan_count), self._attention_attr(orphan_level, badge=(orphan_level == "alert"))),
+            ("  problematic", label_attr),
+            ("=", normal_attr),
+            (str(snapshot.problematic_count), self._attention_attr(problem_level, badge=(problem_level == "alert"))),
+            ("  reclaim~", label_attr),
+            ("=", normal_attr),
+            (_fmt_kib_short(snapshot.reclaimable_kib), self._attention_attr(reclaim_level, badge=(reclaim_level == "alert"))),
+        ]
+
+    def _system_operator_note_lines(self, snapshot: Optional[SystemSnapshot]) -> List[str]:
+        if snapshot is None:
+            return [
+                "No system snapshot is loaded yet.",
+                "",
+                "Press [r] in System view first, then reopen this note.",
+            ]
+        lines: List[str] = [
+            "Operator Note",
+            "",
+            "This panel is read-only. It does not kill or restart anything.",
+            "Use it to estimate whether a later maintenance action is worth it.",
+            "",
+            f"Current service state: {snapshot.service.active_state}/{snapshot.service.sub_state}",
+            f"KillMode: {snapshot.service.kill_mode}",
+            f"Potential reclaimable memory estimate: {_fmt_kib_short(snapshot.reclaimable_kib)}",
+            f"Problematic processes: {snapshot.problematic_count}",
+            f"Zombies: {snapshot.zombie_count}    Orphans: {snapshot.orphan_count}",
+            "",
+        ]
+        if snapshot.reclaimable_kib > 0:
+            lines.append(
+                f"If you later clean residual helpers or restart the gateway cleanly, the system may recover roughly {_fmt_kib_short(snapshot.reclaimable_kib)} of RSS."
+            )
+        else:
+            lines.append("This snapshot does not currently suggest a large memory recovery opportunity.")
+        if (snapshot.service.kill_mode or "").strip() != "control-group":
+            lines.extend(
+                [
+                    "",
+                    "Important:",
+                    "The runbook strongly prefers KillMode=control-group for the gateway service.",
+                    "KillMode=process can leave helper processes behind after restart, which is one of the main reasons TasksCurrent and MemoryCurrent become misleadingly high over time.",
+                    "",
+                    "Suggested drop-in:",
+                    "~/.config/systemd/user/openclaw-gateway.service.d/30-killmode-control-group.conf",
+                    "[Service]",
+                    "KillMode=control-group",
+                ]
+            )
+        if snapshot.orphan_count > 0 or snapshot.zombie_count > 0 or snapshot.problematic_count > 0:
+            lines.extend(
+                [
+                    "",
+                    "Why cleanup may help:",
+                    "The snapshot shows residual helpers, zombies, or orphaned processes inside or around the gateway lifecycle.",
+                    "That usually means the service has become dirty after long uptime or incomplete restarts.",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Before a maintenance restart, the runbook suggests checking:",
+                "systemctl --user show openclaw-gateway.service -p MainPID -p TasksCurrent -p MemoryCurrent -p KillMode -p SubState",
+                "systemd-cgls --user-unit openclaw-gateway.service",
+                "openclaw gateway probe --timeout 10000 --json",
+                "",
+                "Standard restart sequence:",
+                "systemctl --user daemon-reload",
+                "systemctl --user restart openclaw-gateway.service",
+                "",
+                "After restart, confirm:",
+                "- service is running",
+                "- KillMode=control-group",
+                "- TasksCurrent and MemoryCurrent dropped",
+                "- only the current gateway generation remains in the cgroup",
+                "- gateway probe is healthy",
+                "",
+                "Risk warning:",
+                "A restart interrupts in-flight runs that belong to openclaw-gateway.service.",
+                "KillMode=control-group does not create that risk; it makes the restart cleanup complete and predictable.",
+                "",
+                "Practical rule:",
+                "Do not restart while a critical long-running task is active unless interruption is acceptable.",
+            ]
+        )
+        return lines
 
     def _session_cache_tokens(self, sv: SessionView) -> Optional[int]:
         vals = [sv.meta.cache_read_tokens or 0, sv.meta.cache_write_tokens or 0]
@@ -1758,7 +2640,7 @@ class ClawMonitorTUI:
     def _footer_height(self, total_h: int) -> int:
         return 2 if total_h >= 12 else 1
 
-    def _draw_footer(self, stdscr: "curses._CursesWindow", width: int, lines: List[str]) -> None:
+    def _draw_footer(self, stdscr: "curses._CursesWindow", width: int, lines: List[Union[str, List[Tuple[str, int]]]]) -> None:
         h, _ = stdscr.getmaxyx()
         footer_h = self._footer_height(h)
         start_y = h - footer_h
@@ -1766,7 +2648,12 @@ class ClawMonitorTUI:
         while len(render_lines) < footer_h:
             render_lines.insert(0, "")
         for idx, line in enumerate(render_lines):
-            self._safe_addnstr(stdscr, start_y + idx, 0, line.ljust(width), width, curses.A_REVERSE)
+            row_y = start_y + idx
+            if isinstance(line, list):
+                self._safe_addnstr(stdscr, row_y, 0, " ".ljust(width), width)
+                self._safe_add_segments(stdscr, row_y, 0, line, width)
+            else:
+                self._safe_addnstr(stdscr, row_y, 0, line.ljust(width), width, curses.A_REVERSE)
 
     def _cycle_pane_zoom_mode(self) -> None:
         order = ["sessions", "even", "detail", "list"]
@@ -1831,6 +2718,169 @@ class ClawMonitorTUI:
         self.session_token_window_days = 0
         self.pane_zoom_mode = "even"
         self.detail_fullscreen = False
+
+    def _switch_view_mode(self, mode: str) -> None:
+        self.view_mode = mode
+        if mode == "system":
+            self._maybe_request_system_refresh()
+
+    def _footer_refresh_segments(
+        self,
+        *,
+        label: str,
+        refresh_age: str,
+        in_prog: bool,
+        err: Optional[str],
+        prog_step: int,
+        prog_total: int,
+        prog_msg: str,
+    ) -> List[Tuple[str, int]]:
+        parts: List[Tuple[str, int]] = []
+        if in_prog:
+            badge = label
+            if prog_total > 0:
+                badge += f" {prog_step}/{prog_total}"
+            parts.extend(self._footer_badge(badge, "loading"))
+            if prog_msg:
+                parts.append((prog_msg[:28], self._semantic_attr("working")))
+        elif err:
+            parts.extend(self._footer_badge(f"{label} ERROR", "error"))
+            parts.append((err[:36], self._semantic_attr("alert")))
+        else:
+            parts.extend(self._footer_badge(f"{label} READY", "ready"))
+            parts.append((f"age={refresh_age}", self._semantic_attr("ok")))
+        return parts
+
+    def _session_footer_status_segments(
+        self,
+        *,
+        refresh_age: str,
+        in_prog: bool,
+        err: Optional[str],
+        prog_step: int,
+        prog_total: int,
+        prog_msg: str,
+        sel_pos: int,
+        sel_total: int,
+        sv: Optional[SessionView],
+    ) -> List[Tuple[str, int]]:
+        segs: List[Tuple[str, int]] = []
+        segs.extend(self._footer_badge(f"SESSIONS {self.session_detail_mode.upper()}", "info"))
+        segs.extend(
+            self._footer_refresh_segments(
+                label="REFRESH",
+                refresh_age=refresh_age,
+                in_prog=in_prog,
+                err=err,
+                prog_step=prog_step,
+                prog_total=prog_total,
+                prog_msg=prog_msg,
+            )
+        )
+        if self.session_detail_mode == "history" and sv:
+            hs, _, stale = self._history_events_for_view(sv)
+            label = hs.load_state.upper().replace("_", " ")
+            level = "warn" if hs.load_state == "not_loaded" else hs.load_state
+            if stale and hs.load_state == "ready":
+                label = "READY/STALE"
+                level = "stale"
+            segs.extend(self._footer_badge(f"HIST {label} {self.history_range_days}D", level))
+        if self.session_metric_page == "tokens":
+            if self.session_token_window_days <= 0:
+                segs.extend(self._footer_badge("TOK NOW", "ready"))
+            else:
+                tus = self._token_usage_state_for(self.session_token_window_days)
+                label = tus.load_state.upper().replace("_", " ")
+                level = "warn" if tus.load_state == "not_loaded" else tus.load_state
+                if tus.load_state == "ready" and history_usage_is_stale(tus.last_loaded_at):
+                    label = "READY/STALE"
+                    level = "stale"
+                segs.extend(self._footer_badge(f"TOK {self.session_token_window_days}D {label}", level))
+        if sv and sv.findings:
+            sev = (sv.findings[0].severity or "").lower()
+            level = "alert" if sev in ("error", "critical", "high", "warn", "warning") else "warn"
+            segs.extend(self._footer_badge(f"DIAG {sv.findings[0].id}", level))
+        elif sv and (sv.delivery_failure or sv.computed.no_feedback or sv.computed.safety_alert or sv.computed.safeguard_alert):
+            segs.extend(self._footer_badge("ALERTS", "alert"))
+        segs.append((f"sel={sel_pos}/{sel_total} ", curses.A_BOLD))
+        segs.append((f"cols={self._session_metric_page_label()} panes={self._pane_zoom_label()} ", self._semantic_attr("info")))
+        segs.append((f"full={'on' if self.detail_fullscreen else 'off'}", curses.A_BOLD))
+        return segs
+
+    def _model_footer_status_segments(
+        self,
+        *,
+        refresh_age: str,
+        in_prog: bool,
+        err: Optional[str],
+        prog_step: int,
+        prog_total: int,
+        prog_msg: str,
+        sel_pos: int,
+        sel_total: int,
+        row_count: int,
+    ) -> List[Tuple[str, int]]:
+        segs: List[Tuple[str, int]] = []
+        segs.extend(self._footer_badge("MODELS", "info"))
+        segs.extend(
+            self._footer_refresh_segments(
+                label="PROBE",
+                refresh_age=refresh_age,
+                in_prog=in_prog,
+                err=err,
+                prog_step=prog_step,
+                prog_total=prog_total,
+                prog_msg=prog_msg,
+            )
+        )
+        segs.append((f"sel={sel_pos}/{sel_total} rows={row_count}", curses.A_BOLD))
+        return segs
+
+    def _system_footer_status_segments(
+        self,
+        *,
+        refresh_age: str,
+        in_prog: bool,
+        err: Optional[str],
+        prog_msg: str,
+        sel_pos: int,
+        sel_total: int,
+        snapshot: Optional[SystemSnapshot],
+    ) -> List[Tuple[str, int]]:
+        segs: List[Tuple[str, int]] = []
+        segs.extend(self._footer_badge("SYSTEM", "info"))
+        segs.extend(
+            self._footer_refresh_segments(
+                label="SNAPSHOT",
+                refresh_age=refresh_age,
+                in_prog=in_prog,
+                err=err,
+                prog_step=0,
+                prog_total=0,
+                prog_msg=prog_msg,
+            )
+        )
+        if snapshot is not None:
+            segs.extend(self._footer_badge(f"RISK {snapshot.service_risk.upper()}", snapshot.service_risk))
+            segs.append(("z=", self._section_attr("COUNTS")))
+            segs.append((str(snapshot.zombie_count), self._semantic_attr(self._system_zombie_level(snapshot.zombie_count), badge=(self._system_zombie_level(snapshot.zombie_count) == "alert"))))
+            segs.append(("  orph=", self._section_attr("COUNTS")))
+            segs.append((str(snapshot.orphan_count), self._semantic_attr(self._system_orphan_level(snapshot.orphan_count), badge=(self._system_orphan_level(snapshot.orphan_count) == "alert"))))
+            segs.append(("  prob=", self._section_attr("COUNTS")))
+            segs.append((str(snapshot.problematic_count), self._semantic_attr(self._system_problem_level(snapshot.problematic_count), badge=(self._system_problem_level(snapshot.problematic_count) == "alert"))))
+            segs.append(("  reclaim~", self._section_attr("COUNTS")))
+            segs.append((_fmt_kib_short(snapshot.reclaimable_kib), self._semantic_attr(self._system_reclaim_level(snapshot.reclaimable_kib), badge=(self._system_reclaim_level(snapshot.reclaimable_kib) == "alert"))))
+            segs.append(("  ", 0))
+        segs.append((f"sel={sel_pos}/{sel_total} panes={self._system_pane_zoom_label()}", curses.A_BOLD))
+        return segs
+
+    def _cycle_view_mode(self) -> None:
+        order = ["sessions", "models", "system"]
+        try:
+            idx = order.index(self.view_mode)
+        except ValueError:
+            idx = 0
+        self._switch_view_mode(order[(idx + 1) % len(order)])
 
     def _should_jump_agent(self, key_name: str) -> bool:
         now = time.time()
@@ -1983,12 +3033,16 @@ class ClawMonitorTUI:
 
             sv = it.sv
             user_msg = sv.tail.last_user_send
-            u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
-            a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
+            u_age_sec = _age_seconds(user_msg.ts if user_msg else sv.updated_at)
+            a_age_sec = _age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None)
+            u_age = _fmt_age(u_age_sec)
+            a_age = _fmt_age(a_age_sec)
             run = "-"
             run_at = sv.lock.created_at if sv.lock else (sv.working.created_at if sv.working else None)
+            run_sec: Optional[int] = None
             if run_at:
-                run = _fmt_age(int((datetime.now(timezone.utc) - run_at).total_seconds()))
+                run_sec = int((datetime.now(timezone.utc) - run_at).total_seconds())
+                run = _fmt_age(run_sec)
             flags: List[str] = []
             health_cls = _health_class(
                 state=sv.computed.state,
@@ -2030,40 +3084,53 @@ class ClawMonitorTUI:
                         lbl2 = f"{lbl}({suf})" if suf else lbl
                         node_leaf = f"{it.node_label}:{lbl2}"
             node_text = f"{indent}- {node_leaf}"
-            parts = [
-                _fit(node_text, node_w),
-                _fit(self._state_short_label(sv.computed.state.value), state_w),
+            selected = (idx == self.selected)
+            row_attr = self._row_attr(health_cls, selected=selected)
+            segments: List[Tuple[str, int]] = [
+                (_fit(node_text, node_w), row_attr),
+                ("  ", row_attr),
+                (_fit(self._state_short_label(sv.computed.state.value), state_w), self._session_state_cell_attr(sv, health_cls, selected=selected)),
             ]
             if page == "tokens":
                 range_entry = range_result.sessions_by_key.get(sv.meta.key) if range_result else None
                 if bool(layout["show_tok_in"]):
-                    text = _fmt_tokens_short(range_entry.totals.input_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(sv.meta.input_tokens) if self.session_token_window_days == 0 else "-")
-                    parts.append(_fit(text, int(layout["tok_in_w"])))
+                    val = range_entry.totals.input_tokens if self.session_token_window_days > 0 and range_entry else (sv.meta.input_tokens if self.session_token_window_days == 0 else None)
+                    text = _fmt_tokens_short(val) if val is not None else "-"
+                    segments.extend([("  ", row_attr), (_fit(text, int(layout["tok_in_w"])), self._selected_attr(self._semantic_attr(self._token_volume_level(val)), selected=selected))])
                 if bool(layout["show_tok_out"]):
-                    text = _fmt_tokens_short(range_entry.totals.output_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(sv.meta.output_tokens) if self.session_token_window_days == 0 else "-")
-                    parts.append(_fit(text, int(layout["tok_out_w"])))
+                    val = range_entry.totals.output_tokens if self.session_token_window_days > 0 and range_entry else (sv.meta.output_tokens if self.session_token_window_days == 0 else None)
+                    text = _fmt_tokens_short(val) if val is not None else "-"
+                    segments.extend([("  ", row_attr), (_fit(text, int(layout["tok_out_w"])), self._selected_attr(self._semantic_attr(self._token_volume_level(val)), selected=selected))])
                 if bool(layout["show_tok_cache"]):
-                    text = _fmt_tokens_short(range_entry.totals.cache_read_tokens + range_entry.totals.cache_write_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(self._session_cache_tokens(sv)) if self.session_token_window_days == 0 else "-")
-                    parts.append(_fit(text, int(layout["tok_cache_w"])))
+                    val = (
+                        range_entry.totals.cache_read_tokens + range_entry.totals.cache_write_tokens
+                        if self.session_token_window_days > 0 and range_entry
+                        else (self._session_cache_tokens(sv) if self.session_token_window_days == 0 else None)
+                    )
+                    text = _fmt_tokens_short(val) if val is not None else "-"
+                    segments.extend([("  ", row_attr), (_fit(text, int(layout["tok_cache_w"])), self._selected_attr(self._semantic_attr(self._token_volume_level(val)), selected=selected))])
                 if bool(layout["show_tok_ctx"]):
                     if self.session_token_window_days > 0:
-                        text = _fmt_tokens_short(range_entry.totals.total_tokens) if range_entry else "-"
+                        val = range_entry.totals.total_tokens if range_entry else None
+                        text = _fmt_tokens_short(val) if val is not None else "-"
+                        attr = self._selected_attr(self._semantic_attr(self._token_volume_level(val)), selected=selected)
                     else:
+                        val = sv.meta.total_tokens
                         text = self._session_context_pct(sv)
-                    parts.append(_fit(text, int(layout["tok_ctx_w"])))
+                        attr = self._selected_attr(self._semantic_attr(self._context_level(sv.meta.total_tokens, sv.meta.context_tokens)), selected=selected)
+                    segments.extend([("  ", row_attr), (_fit(text, int(layout["tok_ctx_w"])), attr)])
             else:
                 if bool(layout["show_u_age"]):
-                    parts.append(f"{u_age:>5}")
+                    segments.extend([("  ", row_attr), (f"{u_age:>5}", self._selected_attr(self._semantic_attr(self._session_idle_level(u_age_sec)), selected=selected))])
                 if bool(layout["show_a_age"]):
-                    parts.append(f"{a_age:>5}")
+                    segments.extend([("  ", row_attr), (f"{a_age:>5}", self._selected_attr(self._semantic_attr(self._session_idle_level(a_age_sec)), selected=selected))])
                 if bool(layout["show_run"]):
-                    parts.append(f"{run:>5}")
+                    segments.extend([("  ", row_attr), (f"{run:>5}", self._selected_attr(self._semantic_attr(self._session_run_level(run_sec)), selected=selected))])
                 if bool(layout["show_flags"]):
-                    parts.append(_fit(flag_str, flags_w))
-            parts.append(it.key_tail)
-            line = "  ".join(parts)
-            attr = self._row_attr(health_cls, selected=(idx == self.selected))
-            self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
+                    segments.extend([("  ", row_attr), (_fit(flag_str, flags_w), self._session_flag_attr(flag_str, health_cls, selected=selected))])
+            segments.extend([("  ", row_attr), (it.key_tail, row_attr)])
+            self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
+            self._safe_add_segments(stdscr, row_y, 0, segments, w, pad_attr=row_attr)
 
     def _state_short_label(self, value: str) -> str:
         mapping = {
@@ -2078,9 +3145,7 @@ class ClawMonitorTUI:
         status = (row.overall_status or "").strip()
         if status == "ok":
             return "ok"
-        if status in ("degraded", "timeout", "rate_limit", "overloaded"):
-            return "working"
-        if status in ("unsupported", "unknown"):
+        if status in ("degraded", "timeout", "rate_limit", "overloaded", "unsupported", "unknown"):
             return "idle"
         return "alert"
 
@@ -2115,16 +3180,23 @@ class ClawMonitorTUI:
                 self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
                 continue
             row = rows[idx]
-            line = (
-                f"{_fit(row.overall_status.upper(), state_w)}  "
-                f"{_fit(row.target.agent_label, 14)}  "
-                f"{_fit(row.target.model_ref, model_w)}  "
-                f"{_fit(','.join(row.target.roles), role_w)}  "
-                f"{_fit(self._probe_metric(row.direct), probe_w)}  "
-                f"{_fit(self._probe_metric(row.openclaw), probe_w)}"
-            )
-            attr = self._row_attr(self._model_health_class(row), selected=(idx == self.model_selected))
-            self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
+            selected = (idx == self.model_selected)
+            row_attr = self._row_attr(self._model_health_class(row), selected=selected)
+            segments: List[Tuple[str, int]] = [
+                (_fit(row.overall_status.upper(), state_w), self._selected_attr(self._model_status_attr(row.overall_status), selected=selected)),
+                ("  ", row_attr),
+                (_fit(row.target.agent_label, 14), row_attr),
+                ("  ", row_attr),
+                (_fit(row.target.model_ref, model_w), row_attr),
+                ("  ", row_attr),
+                (_fit(",".join(row.target.roles), role_w), row_attr),
+                ("  ", row_attr),
+                (_fit(self._probe_metric(row.direct), probe_w), self._probe_cell_attr(row.direct, selected=selected)),
+                ("  ", row_attr),
+                (_fit(self._probe_metric(row.openclaw), probe_w), self._probe_cell_attr(row.openclaw, selected=selected)),
+            ]
+            self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
+            self._safe_add_segments(stdscr, row_y, 0, segments, w, pad_attr=row_attr)
 
     def _draw_model_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, row: Optional[ModelRow]) -> None:
         for j in range(h):
@@ -2154,8 +3226,245 @@ class ClawMonitorTUI:
         for i in range(min(h, len(lines))):
             attr = 0
             if lines[i] in ("Direct Probe:", "OpenClaw Probe:"):
-                attr = curses.A_BOLD
+                attr = self._section_attr(lines[i])
+            elif lines[i].startswith("Overall:"):
+                attr = curses.A_BOLD | self._model_status_attr(row.overall_status)
+            elif lines[i].startswith("Summary:"):
+                attr = self._model_status_attr(row.overall_status)
+            elif lines[i].startswith("  status="):
+                status_text = lines[i].split("status=", 1)[1].split(None, 1)[0].strip()
+                attr = self._probe_status_attr(status_text)
+            elif lines[i].startswith("  detail:"):
+                attr = self._color_idle if self._colors_enabled else 0
+            elif lines[i].startswith("  reply:"):
+                attr = self._color_magenta if self._colors_enabled else 0
             self._safe_addnstr(stdscr, y + i, x, _fit(lines[i], w), w, attr)
+
+    def _draw_system_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, snapshot: Optional[SystemSnapshot]) -> None:
+        if w < 28:
+            fam_w = max(8, w - 9)
+            risk_w = 6
+            count_w = 0
+            rss_w = 0
+            cpu_w = 0
+            z_w = 0
+            orph_w = 0
+            recl_w = 0
+        elif w < 40:
+            fam_w = max(10, w - 19)
+            risk_w = 6
+            count_w = 5
+            rss_w = 0
+            cpu_w = 0
+            z_w = 0
+            orph_w = 0
+            recl_w = 0
+        else:
+            fam_w = max(12, min(22, int(w * 0.28)))
+            risk_w = 6
+            count_w = 5
+            rss_w = 7
+            cpu_w = 6
+            z_w = 3
+            orph_w = 4
+            recl_w = 7
+        show_cpu = cpu_w > 0 and w >= 58
+        show_orph = orph_w > 0 and w >= 66
+        header_parts = [
+            _fit("FAMILY", fam_w),
+            _fit("RISK", risk_w),
+        ]
+        if count_w > 0:
+            header_parts.append(_fit("PROC", count_w))
+        if rss_w > 0:
+            header_parts.append(_fit("RSS", rss_w))
+        if show_cpu:
+            header_parts.append(_fit("CPU", cpu_w))
+        if z_w > 0:
+            header_parts.append(_fit("Z", z_w))
+        if show_orph:
+            header_parts.append(_fit("ORPH", orph_w))
+        if recl_w > 0:
+            header_parts.append(_fit("RECL", recl_w))
+        self._safe_addnstr(stdscr, y, 0, "  ".join(header_parts).ljust(w), w, curses.A_BOLD)
+        visible = max(0, h - 1)
+        keys = self._system_row_keys(snapshot)
+        if self.system_selected < self.system_scroll:
+            self.system_scroll = self.system_selected
+        if self.system_selected >= self.system_scroll + visible:
+            self.system_scroll = self.system_selected - visible + 1
+        for i in range(visible):
+            row_y = y + 1 + i
+            idx = self.system_scroll + i
+            if idx >= len(keys):
+                self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
+                continue
+            if snapshot is None:
+                text = "SERVICE" if idx == 0 else "-"
+                attr = self._risk_attr("warn", selected=(idx == self.system_selected))
+                self._safe_addnstr(stdscr, row_y, 0, _fit(text, w).ljust(w), w, attr)
+                continue
+            if idx == 0:
+                row_risk = snapshot.service_risk
+                parts = [
+                    _fit("SERVICE", fam_w),
+                    _fit(row_risk.upper(), risk_w),
+                ]
+                if count_w > 0:
+                    parts.append(_fit(str(snapshot.cgroup_process_count), count_w))
+                if rss_w > 0:
+                    parts.append(_fit(_fmt_bytes_short(snapshot.service.memory_current_bytes), rss_w))
+                if show_cpu:
+                    parts.append(_fit("-", cpu_w))
+                if z_w > 0:
+                    parts.append(_fit(str(snapshot.zombie_count), z_w))
+                if show_orph:
+                    parts.append(_fit(str(snapshot.orphan_count), orph_w))
+                if recl_w > 0:
+                    parts.append(_fit(_fmt_kib_short(snapshot.reclaimable_kib), recl_w))
+                attr = self._risk_attr(row_risk, selected=(idx == self.system_selected))
+                self._safe_addnstr(stdscr, row_y, 0, "  ".join(parts).ljust(w), w, attr)
+                continue
+            fam = snapshot.families[idx - 1]
+            parts = [
+                _fit(fam.family, fam_w),
+                _fit(fam.risk.upper(), risk_w),
+            ]
+            if count_w > 0:
+                parts.append(_fit(str(fam.count), count_w))
+            if rss_w > 0:
+                parts.append(_fit(_fmt_kib_short(fam.rss_kib), rss_w))
+            if show_cpu:
+                parts.append(_fit(_fmt_pct_short(fam.cpu_pct), cpu_w))
+            if z_w > 0:
+                parts.append(_fit(str(fam.zombie_count), z_w))
+            if show_orph:
+                parts.append(_fit(str(fam.orphan_count), orph_w))
+            if recl_w > 0:
+                parts.append(_fit(_fmt_kib_short(fam.reclaimable_kib), recl_w))
+            attr = self._risk_attr(fam.risk, selected=(idx == self.system_selected))
+            self._safe_addnstr(stdscr, row_y, 0, "  ".join(parts).ljust(w), w, attr)
+
+    def _draw_system_details(
+        self,
+        stdscr: "curses._CursesWindow",
+        x: int,
+        y: int,
+        h: int,
+        w: int,
+        snapshot: Optional[SystemSnapshot],
+        family: Optional[SystemFamilySummary],
+    ) -> None:
+        for j in range(h):
+            self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
+        if h <= 0:
+            return
+        if snapshot is None:
+            attr = curses.A_BOLD | self._risk_attr("warn")
+            self._safe_addnstr(stdscr, y, x, _fit("SYSTEM DETAIL | No snapshot yet. Press [r] or wait for auto refresh.", w), w, attr)
+            if h > 1:
+                self._safe_addnstr(stdscr, y + 1, x, _fit("[v] next view  [r] refresh  [z] panes  [Esc] back to sessions", w), w)
+            return
+
+        sample_age = "-"
+        with self._system_lock:
+            state = self._system_state
+            if state.last_loaded_at is not None:
+                sample_age = _fmt_age(int(max(0.0, time.time() - state.last_loaded_at))).strip()
+        title = f"SYSTEM DETAIL  [o] ops note  [r] refresh  [z] panes={self._system_pane_zoom_label()}  [v] next view  [Esc] reset"
+        self._safe_addnstr(
+            stdscr,
+            y,
+            x,
+            _fit(title, w),
+            w,
+            self._section_attr("SERVICE", risk=snapshot.service_risk, active=(state.load_state == "loading")),
+        )
+        recent_events = self._recent_monitor_events(limit=4)
+        section_lines: List[Tuple[str, int]] = [
+            ("SERVICE", self._section_attr("SERVICE", risk=snapshot.service_risk)),
+            ("", 0),
+            ("RESOURCES", self._section_attr("RESOURCES")),
+            (
+                f"MainPID={snapshot.service.main_pid or '-'}  TasksCurrent={snapshot.service.tasks_current or '-'}  "
+                f"MemoryCurrent={_fmt_bytes_short(snapshot.service.memory_current_bytes)}  CPU(ns)={snapshot.service.cpu_usage_nsec or '-'}",
+                0,
+            ),
+            (f"CGroup={snapshot.service.control_group or '-'}", 0),
+            ("COUNTS", self._section_attr("COUNTS")),
+            ("", 0),
+            ("ISSUES", self._section_attr("ISSUES", risk=("alert" if snapshot.issues else None))),
+            (
+                (" | ".join(snapshot.issues[:4]) if snapshot.issues else "none"),
+                curses.A_BOLD | self._risk_attr(snapshot.service_risk if snapshot.issues else "ok"),
+            ),
+            ("OPERATOR NOTE", self._section_attr("OPERATOR NOTE")),
+            (
+                f"Press [o] for English runbook guidance. A later clean restart may reclaim about {_fmt_kib_short(snapshot.reclaimable_kib)} if residual helpers are the main source.",
+                self._attention_attr(self._system_reclaim_level(snapshot.reclaimable_kib)),
+            ),
+        ]
+        section_lines.append(("MONITOR EVENTS", self._section_attr("MONITOR EVENTS")))
+        if recent_events:
+            for ev in recent_events:
+                section_lines.append((self._format_monitor_event(ev), self._monitor_event_attr(ev.event)))
+        else:
+            section_lines.append(("no recent monitor-origin actions", 0))
+
+        body_y = y + len(section_lines) + 1
+        special_lines = {
+            1: self._system_service_line_segments(snapshot, sample_age=sample_age),
+            6: self._system_counts_line_segments(snapshot),
+        }
+        for idx, (line, attr) in enumerate(section_lines):
+            if y + 1 + idx >= y + h:
+                return
+            if idx in special_lines:
+                self._safe_add_segments(stdscr, y + 1 + idx, x, special_lines[idx], w)
+            else:
+                self._safe_addnstr(stdscr, y + 1 + idx, x, _fit(line, w), w, attr)
+
+        if body_y >= y + h:
+            return
+
+        if family is None:
+            heading = "PROCESS DETAIL | SERVICE SUMMARY"
+            target = [proc for proc in snapshot.processes if proc.potentially_problematic]
+            if not target:
+                target = list(snapshot.processes[: min(8, len(snapshot.processes))])
+            summary_line = (
+                f"selected=SERVICE  families={len(snapshot.families)}  "
+                f"showing={min(len(target), max(0, h - (body_y - y) - 2))}  "
+                f"use [↑/↓] to pick a family on the left"
+            )
+        else:
+            heading = f"PROCESS DETAIL | {family.family}  risk={family.risk.upper()}  count={family.count}  live={family.live_count}  zombies={family.zombie_count}"
+            target = [proc for proc in snapshot.processes if proc.family == family.family]
+            note = " | ".join(family.notes) if family.notes else "no extra notes"
+            summary_line = (
+                f"rss={_fmt_kib_short(family.rss_kib)}  cpu={_fmt_pct_short(family.cpu_pct)}  "
+                f"reclaim~{_fmt_kib_short(family.reclaimable_kib)}  notes={note}"
+            )
+        self._safe_addnstr(stdscr, body_y, x, _fit(heading, w), w, self._section_attr("PROCESS DETAIL", risk=(family.risk if family else snapshot.service_risk)))
+        if body_y + 1 >= y + h:
+            return
+        self._safe_addnstr(stdscr, body_y + 1, x, _fit(summary_line, w), w)
+        table_y = body_y + 2
+        if table_y >= y + h:
+            return
+        proc_header = f"{_fit('PID', 6)}  {_fit('STAT', 4)}  {_fit('RSS', 7)}  {_fit('CPU', 6)}  {_fit('REL', 8)}  CMD"
+        self._safe_addnstr(stdscr, table_y, x, _fit(proc_header, w), w, self._section_attr("PROCESS DETAIL"))
+        max_rows = max(0, h - (table_y - y) - 1)
+        for idx, proc in enumerate(target[:max_rows]):
+            row_y = table_y + 1 + idx
+            if row_y >= y + h:
+                break
+            cmd = proc.args or proc.comm or "-"
+            line = (
+                f"{_fit(str(proc.pid), 6)}  {_fit(proc.stat, 4)}  {_fit(_fmt_kib_short(proc.rss_kib), 7)}  "
+                f"{_fit(_fmt_pct_short(proc.cpu_pct), 6)}  {_fit(proc.relation, 8)}  {cmd}"
+            )
+            self._safe_addnstr(stdscr, row_y, x, _fit(line, w), w, self._risk_attr(proc.risk))
 
     def _probe_lines(self, probe: Optional[object], *, width: int) -> List[str]:
         if probe is None:
@@ -2583,145 +3892,14 @@ class ClawMonitorTUI:
 
         # Status header + lines
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta, self.model.config_snapshot)
-        mark_str = f" ({','.join(markers)})" if markers else ""
-        key_info = parse_session_key(sv.meta.key)
-        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
-        status_lines: List[str] = [
-            f"SessionKey: {sv.meta.key}",
-            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
-            f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
-            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
-            f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
-        ]
-        status_lines.extend(self._session_usage_lines(sv))
-        status_lines.extend(self._session_range_usage_lines(sv))
-        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
-        if cron_job:
-            label = cron_job.name or cron_job.id
-            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
-            owner = cron_job.agent_id or "-"
-            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
-        if sv.tail.last_entry_type:
-            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
-        if sv.acpx and sv.meta.acpx_session_id:
-            st = sv.meta.acp_state or "-"
-            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
-            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
-        if sv.working and not sv.lock:
-            status_lines.append(
-                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
-            )
-        # Task summary (best-effort): show what the agent is working on right now.
-        if sv.lock:
-            task_src = sv.tail.last_user_send
-            if task_src and task_src.preview:
-                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
-            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
-                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
-            if sv.tail.last_assistant_thinking:
-                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
-                status_lines.extend(think_lines[:2])
-            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
-                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
-                status_lines.append(f"ToolCall: {names}")
-            if sv.tail.last_tool_result:
-                tr = sv.tail.last_tool_result
-                ok = "err" if tr.is_error else "ok"
-                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
-            if sv.tail.last_tool_error:
-                ts, summary = sv.tail.last_tool_error
-                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
-            if last_activity:
-                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
-        elif sv.working:
-            task_src = sv.tail.last_user_send or sv.tail.last_trigger
-            if task_src and task_src.preview:
-                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
-            if sv.tail.last_assistant_thinking:
-                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
-                status_lines.extend(think_lines[:2])
-            if sv.tail.last_tool_call and sv.tail.last_tool_call.tool_names:
-                names = ",".join(sv.tail.last_tool_call.tool_names[:3])
-                status_lines.append(f"ToolCall: {names}")
-            if sv.tail.last_tool_result:
-                tr = sv.tail.last_tool_result
-                ok = "err" if tr.is_error else "ok"
-                status_lines.append(f"ToolResult: {tr.tool_name} {ok} @ {_fmt_dt(tr.ts)}")
-            if sv.tail.last_tool_error:
-                ts, summary = sv.tail.last_tool_error
-                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
-            if last_activity:
-                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
-        acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
-        if acct_info:
-            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
-            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
-            status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
-        if sv.human_out_at:
-            status_lines.append(f"HumanOut: @ {_fmt_dt(sv.human_out_at)}  age={_fmt_age(_age_seconds(sv.human_out_at)).strip()}")
-        else:
-            status_lines.append("HumanOut: -")
-        if sv.internal_activity_at:
-            status_lines.append(
-                f"Internal: @ {_fmt_dt(sv.internal_activity_at)}  age={_fmt_age(_age_seconds(sv.internal_activity_at)).strip()}"
-            )
-        else:
-            status_lines.append("Internal: -")
-        if sv.telegram_binding:
-            b = sv.telegram_binding
-            note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
-            status_lines.append(
-                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
-            )
-        if sv.lock:
-            status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
-        else:
-            status_lines.append("Lock: -")
-        if sv.delivery_failure:
-            status_lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
-        alerts: List[str] = []
-        if sv.computed.no_feedback:
-            alerts.append("NO_FEEDBACK")
-        if sv.computed.safety_alert:
-            alerts.append("SAFETY")
-        if sv.computed.safeguard_alert:
-            alerts.append("SAFEGUARD_OFF")
-        if alerts:
-            status_lines.append("Alerts: " + ",".join(alerts))
-        if sv.findings:
-            status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
-        else:
-            status_lines.append("Diagnosis: (none)")
+        status_lines = self._build_session_status_lines(sv, last_activity=last_activity, width=w)
 
         max_status_lines = max(0, status_h - 1)
-        visible_status_lines = status_lines
-        if max_status_lines and len(status_lines) > max_status_lines:
-            # Keep the most important "header" lines, but always keep tail lines
-            # where alerts/diagnosis live (including Diagnosis: (none)).
-            head_n = min(5, max(1, max_status_lines - 3))
-            tail_n = max(1, max_status_lines - head_n - 1)
-            visible_status_lines = status_lines[:head_n] + ["…"] + status_lines[-tail_n:]
+        visible_status_lines = self._visible_status_lines(status_lines, max_status_lines)
 
         for i in range(min(max_status_lines, len(visible_status_lines))):
             ln = visible_status_lines[i]
-            attr = 0
-            if ln.startswith(("Task:", "Thinking:", "Trigger:", "ToolCall:", "ToolResult:")):
-                attr = self._color_magenta if self._colors_enabled else 0
-            elif ln.startswith(("Token:", "Context:", "Usage ", "UsageCost ")):
-                attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
-            elif ln.startswith("Diagnosis:"):
-                if not self._colors_enabled:
-                    attr = curses.A_BOLD
-                else:
-                    low = ln.lower()
-                    if "(none)" in low:
-                        attr = curses.A_BOLD | self._color_ok
-                    elif "[info]" in low:
-                        attr = curses.A_BOLD | self._color_idle
-                    else:
-                        attr = curses.A_BOLD | self._color_alert
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, self._session_status_line_attr(ln))
 
         if msg_h <= 2:
             return
@@ -2811,88 +3989,11 @@ class ClawMonitorTUI:
 
         # Status
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
-        markers = _agent_markers(sv.meta, self.model.config_snapshot)
-        mark_str = f" ({','.join(markers)})" if markers else ""
-        key_info = parse_session_key(sv.meta.key)
-        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
-        status_lines: List[str] = [
-            f"SessionKey: {sv.meta.key}",
-            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
-            f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
-            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
-            f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
-        ]
-        status_lines.extend(self._session_usage_lines(sv))
-        status_lines.extend(self._session_range_usage_lines(sv))
-        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
-        if cron_job:
-            label = cron_job.name or cron_job.id
-            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
-            owner = cron_job.agent_id or "-"
-            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
-        if sv.tail.last_entry_type:
-            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
-        if sv.acpx and sv.meta.acpx_session_id:
-            st = sv.meta.acp_state or "-"
-            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
-            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
-        if sv.working and not sv.lock:
-            status_lines.append(
-                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
-            )
-        if sv.lock:
-            task_src = sv.tail.last_user_send
-            if task_src and task_src.preview:
-                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
-            elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
-                status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
-            if sv.tail.last_assistant_thinking:
-                status_lines.extend(
-                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
-                )
-            if sv.tail.last_tool_error:
-                ts, summary = sv.tail.last_tool_error
-                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
-            if last_activity:
-                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
-        elif sv.working:
-            task_src = sv.tail.last_user_send or sv.tail.last_trigger
-            if task_src and task_src.preview:
-                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
-            if sv.tail.last_assistant_thinking:
-                status_lines.extend(
-                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
-                )
-            if sv.tail.last_tool_error:
-                ts, summary = sv.tail.last_tool_error
-                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
-            if last_activity:
-                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
-        acct_info = _channel_account_info(self.model.channels, channel=sv.meta.channel, account_id=sv.meta.account_id)
-        if acct_info:
-            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info.get("lastInboundAt"), int) else None)
-            out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info.get("lastOutboundAt"), int) else None)
-            status_lines.append(f"Channel IO: in={_fmt_dt(in_at)} out={_fmt_dt(out_at)} running={acct_info.get('running')}")
-        if sv.telegram_binding:
-            b = sv.telegram_binding
-            note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
-            status_lines.append(
-                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
-            )
-        if sv.lock:
-            status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
-        else:
-            status_lines.append("Lock: -")
-        if sv.findings:
-            status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
-        for i in range(min(status_h - 1, len(status_lines))):
-            ln = status_lines[i]
-            attr = 0
-            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
-                attr = self._color_magenta if self._colors_enabled else 0
-            elif ln.startswith(("Token:", "Context:", "Usage ", "UsageCost ")):
-                attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
+        status_lines = self._build_session_status_lines(sv, last_activity=last_activity, width=w)
+        visible_status_lines = self._visible_status_lines(status_lines, max(0, status_h - 1))
+        for i in range(min(status_h - 1, len(visible_status_lines))):
+            ln = visible_status_lines[i]
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, self._session_status_line_attr(ln))
 
         # Last User Send
         self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
@@ -3086,52 +4187,57 @@ class ClawMonitorTUI:
             except Exception as e:
                 self.elog.write("labels.write_failed", key=key, error=str(e))
 
+    def _text_overlay(self, stdscr: "curses._CursesWindow", *, title: str, lines: List[str]) -> None:
+        h, w = stdscr.getmaxyx()
+        win_h = min(max(12, min(len(lines) + 2, h - 4)), max(6, h - 4))
+        win_w = min(100, max(30, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        win.timeout(-1)
+        scroll = 0
+        while True:
+            win.clear()
+            win.border()
+            body_h = max(1, win_h - 3)
+            max_scroll = max(0, len(lines) - body_h)
+            hdr = f" {title}  {scroll + 1}-{min(len(lines), scroll + body_h)}/{len(lines)} "
+            self._safe_addnstr(win, 0, 2, hdr, win_w - 4, self._section_attr(title))
+            view = lines[scroll : scroll + body_h]
+            for i, ln in enumerate(view):
+                attr = 0
+                low = ln.lower()
+                if ln.endswith(":") and len(ln) < 40:
+                    attr = self._section_attr(ln.rstrip(":"))
+                elif ln.startswith("Important") or low.startswith("risk warning"):
+                    attr = self._attention_attr("alert")
+                elif low.startswith("practical rule") or low.startswith("why cleanup may help"):
+                    attr = self._attention_attr("warn")
+                elif ln.startswith("systemctl ") or ln.startswith("openclaw ") or ln.startswith("[Service]") or ln.startswith("KillMode="):
+                    attr = self._semantic_attr("action")
+                self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(ln, win_w - 4), win_w - 4, attr)
+            footer = " [j/k][↑/↓] scroll  [PgUp/PgDn][Space] page  [g/G] top/bottom  [q][Esc][o] close "
+            self._safe_addnstr(win, win_h - 1, 2, _pad_right_cells(footer, win_w - 4), win_w - 4, curses.A_REVERSE)
+            win.refresh()
+            ch = win.getch()
+            if ch in (-1, 27, ord("q"), 10, 13, ord("o")):
+                return
+            if ch in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                scroll = min(max_scroll, scroll + 1)
+            elif ch == curses.KEY_PPAGE:
+                scroll = max(0, scroll - max(1, body_h - 1))
+            elif ch in (curses.KEY_NPAGE, ord(" ")):
+                scroll = min(max_scroll, scroll + max(1, body_h - 1))
+            elif ch in (curses.KEY_HOME, ord("g")):
+                scroll = 0
+            elif ch in (curses.KEY_END, ord("G")):
+                scroll = max_scroll
+
     def _help_overlay(self, stdscr: "curses._CursesWindow") -> None:
-        compact_lines = [
-            "ClawMonitor TUI Help",
-            "",
-            "Top Actions:",
-            "  [?]            Help (press [?] again here for FULL help)",
-            "  z / Z          Cycle split/detail/list panes / fullscreen detail",
-            "  h              Toggle Status / History",
-            "  r              Refresh, or load/reload History",
-            "  ← / →          Switch left-list metric columns (activity / tokens)",
-            "  u              Cycle token window now / 1d / 7d / 30d",
-            "  0 / 1 / 7 / 3  Set token window now / 1d / 7d / 30d (token page)",
-            "  1 / 7          History range 1 day / 7 days",
-            "  b              Bottom panel toggle",
-            "",
-            "Navigation:",
-            "  ↑/↓            Select session",
-            "  PgUp/PgDn      Page through sessions (status view) or history (history view)",
-            "  g / G          Jump to top / bottom (list or history)",
-            "  j / k          Select previous / next history item",
-            "  double j / k   Jump to next agent / first session of previous agent",
-            "  Esc            Return to default surface; press Esc again to quit",
-            "  q              Quit immediately",
-            "",
-            "Actions:",
-            "  v              Toggle session/model view",
-            "  r              Refresh now, or load/reload history in History view",
-            "  R              Rename/label selected session",
-            "  f              Cycle refresh interval (up to 10 minutes)",
-            "  z              Cycle pane layout: left100 -> 50/50 -> detail -> left80",
-            "  Z              Fullscreen detail pane",
-            "  t              Toggle tree view (group by agent)",
-            "  c              Toggle cron jobs in tree view",
-            "  n              Toggle NODE label mode (channel:label)",
-            "  x              Toggle Focus filter (hide stale/boring sessions)",
-            "  Enter          Send nudge (chat.send) using a template",
-            "  e              Export redacted report (JSON+MD)",
-            "  h              Toggle right-side Status / History detail mode",
-            "  1 / 7          Set history range to 1 day / 7 days",
-            "  b              Toggle bottom related logs panel",
-            "  Enter          Expand/collapse the selected history detail block",
-            "  d              Diagnose selected session (includes silent-gap hints)",
-            "",
-            "Tip:",
-            "  Press [?] again for FULL help. Press q or Esc to close.",
-        ]
+        compact_lines = self._compact_help_lines()
         full_only_lines = [
             "",
             "Model view:",
@@ -3139,6 +4245,19 @@ class ClawMonitorTUI:
             "  - Banner shows WAITING / RUNNING / DONE / ERROR for the current probe state.",
             "  - Each row combines direct provider probing and probing through OpenClaw.",
             "  - DIRECT / CLAW columns show the last probe latency when available.",
+            "",
+            "System view:",
+            "  - Separate from Sessions and Models; use [s] or [v] to enter it.",
+            "  - Banner shows WAITING / LOADING / READY / ERROR for local system inspection.",
+            "  - Uses systemctl + ps + /proc/cgroup to summarize the gateway service cgroup.",
+            "  - Left list shows SERVICE plus process families (chrome/playwright, ssh-agent, qmd, node, ...).",
+            "  - Left columns: PROC=count, RSS=live memory, Z=zombies, ORPH=ppid=1, RECL=estimated reclaimable memory.",
+            "  - Right side is split into SERVICE / RESOURCES / COUNTS / ISSUES / PROCESS DETAIL.",
+            "  - Colors: green=healthy, cyan=active/loading, yellow=warn/waiting, red=alert/error, magenta=actions, blue=section labels.",
+            "  - RECL is an estimate of potentially reclaimable RSS, not a guaranteed cleanup result.",
+            "  - In System view, [z] cycles pane widths: 10/90, 50/50, left100, right100.",
+            "  - Press [o] for an English operator note based on the current snapshot and the vpsclaw runbook.",
+            "  - The operator note is advisory only; ClawMonitor still does not execute cleanup commands.",
             "",
             "States (STATE column):",
             "  WORKING        Task is running (lock present or ACPX indicates running).",
@@ -3148,6 +4267,7 @@ class ClawMonitorTUI:
             "",
             "Performance:",
             "  - Refresh runs asynchronously; footer shows refresh progress/errors.",
+            "  - Footer line 2 uses badges so RUNNING / ERROR / READY / STALE stand out immediately.",
             "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
             "  - Token NOW reads local sessions.json only and is cheap.",
             "  - Token 1d/7d/30d uses Gateway sessions.usage and is loaded on demand with [r].",
@@ -3239,6 +4359,98 @@ class ClawMonitorTUI:
                 scroll = 0
             elif ch in (curses.KEY_END, ord("G")):
                 scroll = max(0, len(lines) - (win_h - 2))
+
+    def _compact_help_lines(self) -> List[str]:
+        lines = [
+            f"ClawMonitor Help | Current View: {self._view_label()}",
+            "",
+            "Current View Shortcuts:",
+        ]
+        if self.view_mode == "system":
+            lines.extend(
+                [
+                    "  r              Refresh system snapshot now",
+                    f"  z              Cycle panes ({self._system_pane_zoom_label()}: 10/90 -> 50/50 -> left100 -> right100)",
+                    "  ↑/↓ j/k        Select SERVICE or a process family",
+                    "  PgUp/PgDn      Move by page in the left list",
+                    "  g / G          Jump to top / bottom",
+                    "  o              Open English operator note / restart guidance",
+                    "  v              Next top-level view",
+                    "  Esc            Reset to default surface",
+                    "",
+                    "System Abbreviations:",
+                    "  Svc   service state (active/running, failed, ...)",
+                    "  PROC  process count in this row",
+                    "  RSS   live resident memory",
+                    "  Z     zombie count",
+                    "  ORPH  orphan count (usually PPID=1)",
+                    "  RECL  estimated reclaimable memory, not an exact promise",
+                    "  Prob  potentially problematic process count",
+                    "  Large Prob / Reclaim / orphan counts are highlighted more aggressively.",
+                    "",
+                    "Color Semantics:",
+                    "  green healthy/ready, cyan active/loading, yellow waiting/warn",
+                    "  red alert/error, magenta actions/history, blue section labels",
+                    "",
+                    "Right Panel Sections:",
+                    "  SERVICE / RESOURCES / COUNTS / ISSUES / OPERATOR NOTE / MONITOR EVENTS / PROCESS DETAIL",
+                ]
+            )
+        elif self.view_mode == "models":
+            lines.extend(
+                [
+                    "  r              Run model probes now",
+                    "  ↑/↓ j/k        Select model row",
+                    "  PgUp/PgDn      Move by page",
+                    "  g / G          Jump to top / bottom",
+                    "  v              Next top-level view",
+                    "  s              Jump directly to System",
+                    "  Esc            Reset to default surface",
+                    "",
+                    "Model Columns:",
+                    "  DIRECT         direct provider probe latency",
+                    "  CLAW           probe through OpenClaw latency",
+                    "  overallStatus  OK / DEGRADED / TIMEOUT / ERROR / ...",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "  r              Refresh now, or load history/usage in the active subview",
+                    "  h              Toggle Status / History on the right",
+                    f"  z / Z          Panes={self._pane_zoom_label()} / fullscreen detail={'on' if self.detail_fullscreen else 'off'}",
+                    f"  ← / →          Switch list columns ({self._session_metric_page_label()})",
+                    f"  u              Token window ({self._token_window_label()})",
+                    "  ↑/↓ j/k        Select session, or history item in History mode",
+                    "  PgUp/PgDn      Page through list or history",
+                    "  g / G          Jump to top / bottom",
+                    "  jj / kk        Jump by agent",
+                    "  b              Toggle bottom related logs",
+                    "  v              Next top-level view",
+                    "  s              Jump directly to System",
+                    "  Esc            Reset to default surface",
+                    "",
+                    "Session Abbreviations:",
+                    "  USER  idle since last user send",
+                    "  ASST  idle since last assistant reply",
+                    "  RUN   active run duration",
+                    "  CTX   prompt/context percent used",
+                    "  TOT   total tokens in selected usage window",
+                    "",
+                    "Color Semantics:",
+                    "  green healthy/ready, cyan active/loading, yellow waiting/warn",
+                    "  red alert/error, magenta actions/history, blue section labels",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Global:",
+                "  ?              Press again inside help for the FULL manual",
+                "  q              Quit immediately",
+            ]
+        )
+        return lines
 
     def _export_report(self, sv: SessionView) -> None:
         rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=self.cfg.report_max_log_lines)
@@ -3359,12 +4571,14 @@ class ClawMonitorTUI:
                 curses.init_pair(3, curses.COLOR_CYAN, -1)
                 curses.init_pair(4, curses.COLOR_RED, -1)
                 curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+                curses.init_pair(6, curses.COLOR_BLUE, -1)
                 self._colors_enabled = True
                 self._color_ok = curses.color_pair(1)
                 self._color_working = curses.color_pair(3)
                 self._color_idle = curses.color_pair(2)
                 self._color_alert = curses.color_pair(4)
                 self._color_magenta = curses.color_pair(5)
+                self._color_section = curses.color_pair(6)
         except Exception:
             self._colors_enabled = False
         stdscr.timeout(200)
@@ -3386,6 +4600,8 @@ class ClawMonitorTUI:
                 if not in_prog:
                     self._request_refresh()
                     dirty = True
+            if self.view_mode == "system":
+                self._maybe_request_system_refresh()
 
             sessions_all = self.model.sessions
             sessions = self._apply_session_filter(sessions_all)
@@ -3394,6 +4610,8 @@ class ClawMonitorTUI:
             sv_for_sig = self._selected_session(items)
             model_rows = self.model_monitor.rows
             self._reconcile_model_selection(model_rows)
+            system_snapshot = self._system_snapshot()
+            self._reconcile_system_selection(system_snapshot)
             with self._refresh_lock:
                 session_sig = (
                     self._refresh_in_progress,
@@ -3414,6 +4632,7 @@ class ClawMonitorTUI:
                 )
             history_sig = None
             token_sig = None
+            system_sig = None
             if self.view_mode == "sessions" and sv_for_sig:
                 hs = self._history_state_for(sv_for_sig.meta.key)
                 history_result = hs.result
@@ -3440,7 +4659,31 @@ class ClawMonitorTUI:
                     getattr(token_result, "updated_at_ms", None),
                     len(token_result.sessions_by_key) if token_result else None,
                 )
-            refresh_sig = (self.view_mode, session_sig, model_sig, history_sig, token_sig, self.show_logs)
+            if self.view_mode == "system":
+                with self._system_lock:
+                    st = self._system_state
+                    snap = st.snapshot
+                    system_sig = (
+                        st.load_state,
+                        st.progress_msg,
+                        st.error,
+                        st.last_loaded_at,
+                        getattr(snap, "service_risk", None),
+                        getattr(snap, "problematic_count", None),
+                        getattr(snap, "reclaimable_kib", None),
+                    )
+            live_tick: Optional[int] = None
+            if self.view_mode == "models" and model_sig[0]:
+                live_tick = int(now)
+            elif self.view_mode == "sessions" and session_sig and session_sig[0]:
+                live_tick = int(now)
+            elif self.view_mode == "sessions" and history_sig and history_sig[2] == "loading":
+                live_tick = int(now)
+            elif self.view_mode == "sessions" and token_sig and token_sig[1] == "loading":
+                live_tick = int(now)
+            elif self.view_mode == "system" and system_sig and system_sig[0] == "loading":
+                live_tick = int(now)
+            refresh_sig = (self.view_mode, session_sig, model_sig, history_sig, token_sig, system_sig, self.show_logs, live_tick)
             if refresh_sig != last_refresh_sig:
                 dirty = True
                 last_refresh_sig = refresh_sig
@@ -3469,6 +4712,8 @@ class ClawMonitorTUI:
             if ch == curses.KEY_UP:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, -1)
                 else:
                     self._move_selection(items, -1)
                 dirty = True
@@ -3485,6 +4730,8 @@ class ClawMonitorTUI:
             elif ch == curses.KEY_DOWN:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, 1)
                 else:
                     self._move_selection(items, 1)
                 dirty = True
@@ -3493,6 +4740,8 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), -1, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, -1)
                 else:
                     if self._should_jump_agent("k"):
                         self._move_selection_agent(items, -1)
@@ -3504,6 +4753,8 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), 1, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, 1)
                 else:
                     if self._should_jump_agent("j"):
                         self._move_selection_agent(items, 1)
@@ -3515,6 +4766,8 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), -history_step, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -page_step)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, -page_step)
                 else:
                     self._move_selection(items, -page_step)
                 dirty = True
@@ -3523,6 +4776,8 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), history_step, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, page_step)
+                elif self.view_mode == "system":
+                    self._move_system_selection(system_snapshot, page_step)
                 else:
                     self._move_selection(items, page_step)
                 dirty = True
@@ -3531,6 +4786,8 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), 0, visible_events=history_step, end=False)
                 elif self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=False)
+                elif self.view_mode == "system":
+                    self._move_system_to_edge(system_snapshot, end=False)
                 else:
                     self._move_selection_to_edge(items, end=False)
                 dirty = True
@@ -3539,23 +4796,39 @@ class ClawMonitorTUI:
                     self._move_history_selection(self._selected_session(items), 0, visible_events=history_step, end=True)
                 elif self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=True)
+                elif self.view_mode == "system":
+                    self._move_system_to_edge(system_snapshot, end=True)
                 else:
                     self._move_selection_to_edge(items, end=True)
                 dirty = True
             elif ch == ord("g"):
                 if self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=False)
+                elif self.view_mode == "system":
+                    self._move_system_to_edge(system_snapshot, end=False)
                 else:
                     self._move_selection_to_edge(items, end=False)
                 dirty = True
             elif ch == ord("G"):
                 if self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=True)
+                elif self.view_mode == "system":
+                    self._move_system_to_edge(system_snapshot, end=True)
                 else:
                     self._move_selection_to_edge(items, end=True)
                 dirty = True
             elif ch == ord("v"):
-                self.view_mode = "models" if self.view_mode == "sessions" else "sessions"
+                self._cycle_view_mode()
+                dirty = True
+            elif ch == ord("s"):
+                self._switch_view_mode("system")
+                dirty = True
+            elif ch == ord("o") and self.view_mode == "system":
+                self._text_overlay(
+                    stdscr,
+                    title="Operator Note",
+                    lines=self._system_operator_note_lines(system_snapshot),
+                )
                 dirty = True
             elif ch == ord("r"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
@@ -3566,6 +4839,8 @@ class ClawMonitorTUI:
                     self._request_token_usage_load(self.session_token_window_days)
                 elif self.view_mode == "models":
                     self._request_model_refresh()
+                elif self.view_mode == "system":
+                    self._request_system_refresh()
                 else:
                     self._request_refresh()
                     last_refresh = time.time()
@@ -3578,9 +4853,13 @@ class ClawMonitorTUI:
                 if self.session_detail_mode == "history" and not self.detail_fullscreen and self.pane_zoom_mode == "sessions":
                     self.pane_zoom_mode = "detail"
                 dirty = True
-            elif ch == ord("z") and self.view_mode == "sessions":
-                self._cycle_pane_zoom_mode()
-                dirty = True
+            elif ch == ord("z"):
+                if self.view_mode == "sessions":
+                    self._cycle_pane_zoom_mode()
+                    dirty = True
+                elif self.view_mode == "system":
+                    self._cycle_system_pane_zoom_mode()
+                    dirty = True
             elif ch == ord("Z") and self.view_mode == "sessions":
                 self.detail_fullscreen = not self.detail_fullscreen
                 dirty = True
@@ -3684,6 +4963,8 @@ class ClawMonitorTUI:
             self._reconcile_selection(items)
             model_rows = self.model_monitor.rows
             self._reconcile_model_selection(model_rows)
+            system_snapshot = self._system_snapshot()
+            self._reconcile_system_selection(system_snapshot)
 
             stdscr.erase()
             h, w = stdscr.getmaxyx()
@@ -3692,10 +4973,19 @@ class ClawMonitorTUI:
             content_y = 2
             footer_h = self._footer_height(h)
             list_h = h - content_y - footer_h
+            top_sep_y: Optional[int] = None
             if self.view_mode == "models":
                 banner, banner_attr = self._model_banner()
                 self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
                 content_y = 3
+                top_sep_y = 3
+                list_h = h - content_y - footer_h
+            elif self.view_mode == "system":
+                banner, banner_attr = self._system_banner()
+                self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
+                self._safe_add_segments(stdscr, 3, 0, self._system_subbanner_segments(), w, pad_attr=curses.A_BOLD)
+                content_y = 4
+                top_sep_y = 4
                 list_h = h - content_y - footer_h
             elif self.view_mode == "sessions":
                 token_banner = self._token_banner()
@@ -3703,7 +4993,15 @@ class ClawMonitorTUI:
                     banner, banner_attr = token_banner
                     self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
                     content_y = 3
+                    top_sep_y = 3
                     list_h = h - content_y - footer_h
+            if top_sep_y is not None and top_sep_y < h - footer_h:
+                try:
+                    stdscr.hline(top_sep_y, 0, curses.ACS_HLINE, max(0, w))
+                except curses.error:
+                    pass
+                content_y += 1
+                list_h = h - content_y - footer_h
             if self.view_mode == "sessions":
                 if self.detail_fullscreen:
                     list_w = 0
@@ -3720,8 +5018,19 @@ class ClawMonitorTUI:
                     list_w = max(56, min(max(56, int(w * 0.64)), max(0, w - 24)))
                 else:
                     list_w = max(40, min(max(40, int(w * 0.46)), max(0, w - 28)))
-            else:
+            elif self.view_mode == "models":
                 list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
+            else:
+                if self.system_pane_zoom_mode == "detail90":
+                    list_w = max(18, min(max(18, int(w * 0.10)), max(0, w - 36)))
+                elif self.system_pane_zoom_mode == "even":
+                    list_w = max(34, min(max(34, int(w * 0.50)), max(0, w - 28)))
+                elif self.system_pane_zoom_mode == "left100":
+                    list_w = w
+                elif self.system_pane_zoom_mode == "detail100":
+                    list_w = 0
+                else:
+                    list_w = max(20, min(max(20, int(w * 0.10)), max(0, w - 36)))
             detail_w = w if (self.view_mode == "sessions" and self.detail_fullscreen) else (w - list_w - 1)
             warning_y = max(content_y, h - footer_h - 1)
             if self.view_mode == "models":
@@ -3740,7 +5049,46 @@ class ClawMonitorTUI:
                         0,
                         "Terminal too narrow for model details. Widen window or use `clawmonitor models`.".ljust(w),
                         w,
+                        )
+                sv = None
+            elif self.view_mode == "system":
+                family = self._selected_system_family(system_snapshot)
+                if self.system_pane_zoom_mode == "detail100":
+                    self._draw_system_details(stdscr, x=0, y=content_y, h=h - content_y - footer_h, w=w, snapshot=system_snapshot, family=family)
+                    self._safe_addnstr(
+                        stdscr,
+                        warning_y,
+                        0,
+                        f"RIGHT DETAIL ACTIVE  [z]={self._system_pane_zoom_label()}  Use [↑/↓] to change left selection even when the list is hidden.".ljust(w),
+                        w,
+                        curses.A_BOLD | (self._color_working if self._colors_enabled else 0),
                     )
+                elif self.system_pane_zoom_mode == "left100":
+                    self._draw_system_list(stdscr, y=content_y, h=list_h, w=w, snapshot=system_snapshot)
+                    self._safe_addnstr(
+                        stdscr,
+                        warning_y,
+                        0,
+                        f"LEFT LIST ACTIVE  [z]={self._system_pane_zoom_label()}  PROC=count RSS=live memory Z=zombies ORPH=ppid=1 RECL=estimated reclaimable.".ljust(w),
+                        w,
+                        curses.A_BOLD | (self._color_working if self._colors_enabled else 0),
+                    )
+                else:
+                    self._draw_system_list(stdscr, y=content_y, h=list_h, w=list_w, snapshot=system_snapshot)
+                    if detail_w >= 28 and list_w < w - 1:
+                        try:
+                            stdscr.vline(content_y, list_w, curses.ACS_VLINE, max(0, h - content_y - footer_h))
+                        except curses.error:
+                            pass
+                        self._draw_system_details(stdscr, x=list_w + 1, y=content_y, h=h - content_y - footer_h, w=detail_w, snapshot=system_snapshot, family=family)
+                    else:
+                        self._safe_addnstr(
+                            stdscr,
+                            warning_y,
+                            0,
+                            "Terminal too narrow for system details. Press [z] for right100 or widen the terminal.".ljust(w),
+                            w,
+                        )
                 sv = None
             else:
                 sv = self._selected_session(items)
@@ -3785,6 +5133,18 @@ class ClawMonitorTUI:
                     err = self._model_refresh_error
                 sel_total = len(model_rows)
                 sel_pos = self.model_selected + 1 if model_rows else 0
+            elif self.view_mode == "system":
+                with self._system_lock:
+                    sys_state = self._system_state
+                if sys_state.last_loaded_at is not None:
+                    refresh_age = _fmt_age(int(time.time() - sys_state.last_loaded_at))
+                in_prog = sys_state.load_state == "loading"
+                prog_msg = sys_state.progress_msg
+                prog_step = 0
+                prog_total = 0
+                err = sys_state.error if sys_state.load_state == "error" else None
+                sel_total = len(self._system_row_keys(system_snapshot))
+                sel_pos = self.system_selected + 1 if sel_total else 0
             else:
                 if self._last_refresh_at is not None:
                     refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
@@ -3842,6 +5202,8 @@ class ClawMonitorTUI:
                 refresh_label = "loadUsage"
             elif self.view_mode == "models":
                 refresh_label = "probe"
+            elif self.view_mode == "system":
+                refresh_label = "system"
             footer = (
                 f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]{refresh_label} "
                 + (
@@ -3877,26 +5239,67 @@ class ClawMonitorTUI:
                     )
                     if self.view_mode == "sessions"
                     else (
+                        f"[z]{self._system_pane_zoom_label()} [o]ops-note manual/auto refresh "
+                        f"sel={sel_pos}/{sel_total} rows={max(0, sel_total - 1)}"
+                    )
+                    if self.view_mode == "system"
+                    else (
                         f"manual-model-probe [f]interval={int(self.refresh_seconds)} "
                         f"sel={sel_pos}/{sel_total} rows={len(model_rows)}"
                     )
                 )
             )
-            footer_lines = [footer]
+            footer_lines: List[Union[str, List[Tuple[str, int]]]] = [footer]
             if self.view_mode == "sessions":
+                segs = self._session_footer_status_segments(
+                    refresh_age=refresh_age,
+                    in_prog=in_prog,
+                    err=err,
+                    prog_step=prog_step,
+                    prog_total=prog_total,
+                    prog_msg=prog_msg,
+                    sel_pos=sel_pos,
+                    sel_total=sel_total,
+                    sv=sv,
+                )
+                segs.append(("  ", 0))
+                segs.append((f"sessions={self._last_shown_sessions}/{self._last_total_sessions}  ", curses.A_BOLD))
                 if self.session_detail_mode == "history":
-                    tip = "tip=[←/→] cols [j/k] history [Enter] detail [7] wider-window [r] reload [Esc] reset [jj/kk] agent jump"
+                    segs.append(("[j/k]history [Enter]detail [r]reload [Esc]reset [jj/kk]agent", self._semantic_attr("action")))
                 else:
-                    tip = "tip=[←/→] cols [u] token-window [0/1/7/3] set-window [r] load-usage [h] history [Esc] reset [jj/kk] agent jump"
-                footer_lines.append(
-                    f"detail={self.session_detail_mode} cols={self._session_metric_page_label()} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
-                    f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}{token_note}  {tip}"
-                )
+                    segs.append(("[u]window [r]load [h]history [Esc]reset [jj/kk]agent", self._semantic_attr("action")))
+                footer_lines.append(segs)
             else:
-                footer_lines.append(
-                    f"manual-model-probe sel={sel_pos}/{sel_total} rows={len(model_rows)} lastRefresh={refresh_age}{refresh_note}"
-                )
+                if self.view_mode == "system":
+                    segs = self._system_footer_status_segments(
+                        refresh_age=refresh_age,
+                        in_prog=in_prog,
+                        err=err,
+                        prog_msg=prog_msg,
+                        sel_pos=sel_pos,
+                        sel_total=sel_total,
+                        snapshot=system_snapshot,
+                    )
+                    if system_snapshot is not None:
+                        segs.append(("  ", 0))
+                        segs.append((f"families={len(system_snapshot.families)}  ", curses.A_BOLD))
+                    segs.append(("[z]10/90-50/50-left100-right100 [o]ops [r]refresh [?]help [Esc]reset", self._semantic_attr("action")))
+                    footer_lines.append(segs)
+                else:
+                    segs = self._model_footer_status_segments(
+                        refresh_age=refresh_age,
+                        in_prog=in_prog,
+                        err=err,
+                        prog_step=prog_step,
+                        prog_total=prog_total,
+                        prog_msg=prog_msg,
+                        sel_pos=sel_pos,
+                        sel_total=sel_total,
+                        row_count=len(model_rows),
+                    )
+                    segs.append(("  ", 0))
+                    segs.append(("[r]probe [v]next-view [s]system [Esc]reset", self._semantic_attr("action")))
+                    footer_lines.append(segs)
             self._draw_footer(stdscr, w, footer_lines)
 
             stdscr.refresh()

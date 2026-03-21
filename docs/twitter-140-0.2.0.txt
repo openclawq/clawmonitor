@@ -1,0 +1,1 @@
+ClawMonitor v0.2.0: one keyboard-first OpenClaw monitor for Sessions, Models, Tokens, and System health. New task history, 1d/7d/30d usage, gateway cgroup/zombie visibility, and operator notes. `pip install -U clawmonitor` #OpenClaw

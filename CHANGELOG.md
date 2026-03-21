@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Product scope: ClawMonitor is now a broader OpenClaw operations monitor, covering Session, Model, Token, and System views in one keyboard-first TUI.
+- Session history: add on-demand cached history loading with `todo / doing / done` style task trajectory for the selected session.
+- Token visibility: add current token snapshot in session detail plus Gateway-backed `1d / 7d / 30d` usage windows for selected sessions.
+- System view: add a dedicated `System` surface for `openclaw-gateway.service` health, cgroup process inspection, zombie/orphan detection, reclaimable RSS estimates, and operator-facing risk summaries.
+- Operator note: add an English runbook-style operator note overlay for the current system snapshot, with paging support and cleanup/restart guidance.
+- TUI ergonomics: add clearer per-view `WAITING / RUNNING / READY / ERROR` states, pane-width cycling, fullscreen detail, better `Esc` reset behavior, per-view help, paging, agent jump shortcuts, and stronger status coloring.
+- Models: keep model probing manual/on-demand, show more visible running state, and support parallel probing workers for larger model chains.
+- Events/docs/tests: add monitor event log helpers, system-monitor and event-log tests, system/token research docs, release/demo docs, and automated asciinema demo tooling.
+
 ## 0.1.9
 
 - Model monitor: add `clawmonitor models` to probe configured models directly and/or through OpenClaw.

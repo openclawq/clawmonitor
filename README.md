@@ -2,10 +2,13 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Real-time **OpenClaw** session monitor with:
+Keyboard-first **OpenClaw** monitor with:
 
 - Per-session last inbound **user** message + last outbound **assistant** message (preview + timestamp)
 - Per-model health probes (direct provider API and through OpenClaw itself)
+- On-demand session history with task trajectory (`todo / doing / done`)
+- Token visibility from local session snapshots plus Gateway `1d / 7d / 30d` usage windows
+- Gateway service / cgroup health view with zombie-orphan-helper inspection and reclaim estimates
 - Work state: WORKING / FINISHED / INTERRUPTED / NO_MESSAGE (+ NO_FEEDBACK alert)
 - Long-run visibility via `*.jsonl.lock` (works even if Gateway is down)
 - Optional Gateway log tail + channel runtime snapshot correlation (Feishu/Telegram-focused rules)
@@ -79,7 +82,10 @@ Runtime data (NOT stored in this repo):
 - `g` / `G`: jump to top / bottom
 - `Enter`: nudge selected session (choose template)
 - `?`: show help overlay
-- `v`: toggle session/model view
+- `v`: cycle sessions / models / system views
+- `s`: jump directly to system view
+- `h`: toggle status / history on the right
+- `u`: cycle token windows (`now` / `1d` / `7d` / `30d`)
 - `x`: focus filter (hide stale sessions)
 - `t`: toggle tree view (group by agent)
 - `c`: toggle cron jobs in tree view
@@ -88,6 +94,10 @@ Runtime data (NOT stored in this repo):
 - `l`: toggle related logs panel
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session
+- `z`: cycle pane widths
+- `Z`: toggle fullscreen detail pane
+- `o`: open operator note in system view
+- `Esc`: reset to the default surface
 - `r`: force refresh
 - `f`: cycle refresh interval
 - `q`: quit
@@ -105,7 +115,14 @@ Model view notes:
   - OpenClaw execution path via temporary probe sessions (`--mode openclaw` or `both`)
 - Supported direct transports today: `openai-completions`, `openai-responses`, `anthropic-messages`
 
+Session/token/system notes:
+
+- History loading is on demand. In the session view, press `h` and then `r` to read cached task history for the selected session.
+- Token `1d / 7d / 30d` windows are loaded from Gateway on demand and then cached in the TUI.
+- System view is read-only by design: it summarizes service state, helper buildup, zombies/orphans, and reclaimable memory estimates without killing anything.
+
 See `docs/model-monitor.md` for the probe model, classifications, and UI behavior.
+See `docs/system-monitor.md` and `docs/system-view-guide.zh-CN.md` for the new system view.
 
 ## Telegram note: ACP “thread bindings”
 
