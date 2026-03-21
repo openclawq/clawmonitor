@@ -4240,6 +4240,10 @@ class ClawMonitorTUI:
         compact_lines = self._compact_help_lines()
         full_only_lines = [
             "",
+            "Project:",
+            "  https://github.com/openclawq/clawmonitor",
+            "  Many terminals let you open the URL directly with the mouse or Ctrl+click.",
+            "",
             "Model view:",
             "  - Manual refresh only. Press [r] to run model probes.",
             "  - Banner shows WAITING / RUNNING / DONE / ERROR for the current probe state.",
@@ -4444,6 +4448,9 @@ class ClawMonitorTUI:
             )
         lines.extend(
             [
+                "",
+                "Project:",
+                "  https://github.com/openclawq/clawmonitor",
                 "",
                 "Global:",
                 "  ?              Press again inside help for the FULL manual",
