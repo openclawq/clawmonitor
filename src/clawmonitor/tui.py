@@ -1325,6 +1325,35 @@ class ClawMonitorTUI:
             return snap.agent_label(agent_id)
         return (agent_id or "").strip() or "-"
 
+    def _channel_surface_label(self, channel: Optional[str]) -> str:
+        raw = (channel or "").strip()
+        if not raw:
+            return "-"
+        lowered = raw.lower()
+        if lowered in ("openclaw-weixin", "weixin", "wechat", "openclaw-wechat"):
+            return "weixin"
+        return raw
+
+    def _target_prefix_label(self, channel: Optional[str]) -> str:
+        raw = (channel or "").strip()
+        if not raw:
+            return "-"
+        lowered = raw.lower()
+        if lowered in ("openclaw-weixin", "weixin", "wechat", "openclaw-wechat"):
+            return "WEIXIN"
+        if lowered == "feishu":
+            return "FEISHU"
+        if lowered == "telegram":
+            return "TELEGRAM"
+        return raw.upper()
+
+    def _target_display_text(self, meta: SessionMeta) -> Optional[str]:
+        chan = (meta.channel or "").strip()
+        target = (meta.to or "").strip()
+        if not chan or not target:
+            return None
+        return f"Target: {self._target_prefix_label(chan)}  target:{chan}:{target}"
+
     def _indent_units_for(self, session_key: str) -> int:
         info = parse_session_key(session_key)
         if info.kind == "subagent":
@@ -1346,7 +1375,7 @@ class ClawMonitorTUI:
     def _node_label_for(self, sv: "SessionView") -> str:
         info = parse_session_key(sv.meta.key)
         if info.kind == "channel":
-            return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+            return self._channel_surface_label(sv.meta.channel or info.channel or "channel")
         if info.kind == "cron":
             job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
             if job and job.name:
@@ -2018,6 +2047,8 @@ class ClawMonitorTUI:
                 return curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
         if line.startswith("Delivery FAILED:") or line.startswith("Alerts:"):
             return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        if line.startswith("Target:"):
+            return curses.A_BOLD | (self._color_section if self._colors_enabled else 0)
         if line.startswith("Telegram Binding:"):
             return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         if line.startswith("Diagnosis:"):
@@ -2050,11 +2081,14 @@ class ClawMonitorTUI:
         agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {self._channel_surface_label(sv.meta.channel)}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        target_line = self._target_display_text(sv.meta)
+        if target_line:
+            status_lines.insert(2, target_line)
         status_lines.extend(self._session_usage_lines(sv))
         status_lines.extend(self._session_range_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
@@ -3801,8 +3835,11 @@ class ClawMonitorTUI:
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         lines.append(
-            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}"
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Channel: {self._channel_surface_label(sv.meta.channel)}  Account: {sv.meta.account_id or '-'}"
         )
+        target_line = self._target_display_text(sv.meta)
+        if target_line:
+            lines.append(target_line)
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
