@@ -67,7 +67,7 @@ from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapsh
 from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
 from .labels import has_user_label, session_display_label
 from .redact import redact_text
-from .session_keys import parse_session_key
+from .session_keys import is_modelprobe_session_key, parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .session_history import SessionHistoryResult, TaskHistoryEvent, filter_history_events, history_is_stale, load_session_history
@@ -768,6 +768,8 @@ class MonitorModel:
             if progress and (idx % 12 == 0):
                 tick(f"Tailing transcripts… ({idx+1}/{total})", 8, 8)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
+            if is_modelprobe_session_key(meta.key) and lock is None:
+                continue
             acpx: Optional[AcpxSnapshot] = None
             tail = self._tail_for_meta(meta, lock_present=bool(lock))
             if (not meta.session_file or not meta.session_file.exists()) and meta.acpx_session_id:

@@ -13,7 +13,7 @@ from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
 from .openclaw_cron import match_cron_job, read_cron_snapshot
 from .redact import redact_text
-from .session_keys import parse_session_key
+from .session_keys import is_modelprobe_session_key, parse_session_key
 from .session_tail import tail_for_meta
 from .session_store import SessionMeta, list_sessions
 from .state import WorkState, WorkingSignal, compute_state
@@ -167,11 +167,13 @@ def collect_status(
     for meta in metas:
         if hide_system_sessions and meta.system_sent:
             continue
+        lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
+        if is_modelprobe_session_key(meta.key) and lock is None:
+            continue
         tail, acpx = tail_for_meta(meta, transcript_tail_bytes=transcript_tail_bytes)
         user_msg = tail.last_user_send
         user_preview = redact_text(user_msg.preview) if user_msg else "-"
         assistant_preview = redact_text(tail.last_assistant.preview) if tail.last_assistant else "-"
-        lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
         df = delivery_map.get(meta.key)
         compaction_cfg = cfg_snapshot.compaction_by_agent.get(meta.agent_id) or cfg_snapshot.compaction_by_agent.get("main")
         safeguard_ok = (compaction_cfg.mode == "safeguard") if compaction_cfg and compaction_cfg.mode else False

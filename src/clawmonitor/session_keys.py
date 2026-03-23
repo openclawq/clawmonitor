@@ -69,3 +69,11 @@ def parse_session_key(session_key: str) -> SessionKeyInfo:
     # Otherwise treat the third segment as a channel surface (telegram/feishu/discord/slack/...)
     channel = third or None
     return SessionKeyInfo(kind="channel", channel=channel, subagent_depth=0, parent_key_hint=None)
+
+
+def is_modelprobe_session_key(session_key: str) -> bool:
+    key = (session_key or "").strip()
+    if not key:
+        return False
+    parts = key.split(":")
+    return len(parts) >= 4 and parts[0] == "agent" and parts[2] == "modelprobe"
