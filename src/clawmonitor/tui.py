@@ -2051,6 +2051,8 @@ class ClawMonitorTUI:
             return curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
         if line.startswith("Target:"):
             return curses.A_BOLD | (self._color_section if self._colors_enabled else 0)
+        if line.startswith("Note:"):
+            return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         if line.startswith("Telegram Binding:"):
             return curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
         if line.startswith("Diagnosis:"):
@@ -2069,6 +2071,17 @@ class ClawMonitorTUI:
         head_n = min(5, max(1, max_lines - 3))
         tail_n = max(1, max_lines - head_n - 1)
         return lines[:head_n] + ["…"] + lines[-tail_n:]
+
+    def _session_explainer_lines(self, sv: SessionView, *, key_info, cron_job: Optional[CronJob]) -> List[str]:
+        lines: List[str] = []
+        if sv.computed.state.value == "NO_MESSAGE":
+            if key_info.kind in ("acp", "subagent", "cron", "cron_run"):
+                lines.append("Note: NOMSG is common for ACP/subagent/cron sessions; no direct user message was recorded.")
+            else:
+                lines.append("Note: NOMSG means no direct user message was found in this session transcript.")
+        if cron_job or key_info.kind in ("cron", "cron_run"):
+            lines.append("Note: left-side 'job' rows are cron summaries only; they are informational and not selectable.")
+        return lines
 
     def _build_session_status_lines(
         self,
@@ -2099,6 +2112,7 @@ class ClawMonitorTUI:
             enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
             owner = cron_job.agent_id or "-"
             status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
+        status_lines.extend(self._session_explainer_lines(sv, key_info=key_info, cron_job=cron_job))
         if sv.tail.last_entry_type:
             status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
         if sv.acpx and sv.meta.acpx_session_id:
@@ -3029,7 +3043,7 @@ class ClawMonitorTUI:
             if isinstance(it, _ListCronJob):
                 job = it.job
                 indent = "  " * 1
-                node_text = f"{indent}- cron"
+                node_text = f"{indent}- job"
                 status = (it.last_run.status or "-") if it.last_run else "-"
                 status = status.upper()[:11]
                 run_dt = _dt_from_ms(it.last_run.ts_ms) if it.last_run else None
@@ -3842,12 +3856,14 @@ class ClawMonitorTUI:
         target_line = self._target_display_text(sv.meta)
         if target_line:
             lines.append(target_line)
+        key_info = parse_session_key(sv.meta.key)
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
             enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
             owner = cron_job.agent_id or "-"
             lines.append(f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
+        lines.extend(self._session_explainer_lines(sv, key_info=key_info, cron_job=cron_job))
         if sv.meta.kind or sv.meta.chat_type:
             lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
         lines.append(f"UpdatedAt: {_fmt_dt(sv.updated_at)}")
@@ -4479,6 +4495,8 @@ class ClawMonitorTUI:
                     "  RUN   active run duration",
                     "  CTX   prompt/context percent used",
                     "  TOT   total tokens in selected usage window",
+                    "  NOMSG no direct user message found; common for ACP/subagent/cron/internal sessions",
+                    "  job   cron summary row only; informational and not selectable",
                     "",
                     "Color Semantics:",
                     "  green healthy/ready, cyan active/loading, yellow waiting/warn",
