@@ -263,6 +263,92 @@ def _tail_suffix(session_key: str, *, n: int = 4) -> str:
     return tail[-n:]
 
 
+def _compact_hint(text: Optional[str], *, width: int = 10) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if _display_width(s) <= width:
+        return s
+    if width <= 1:
+        return _truncate_cells(s, width)
+    return _truncate_cells(s, width - 1) + "…"
+
+
+def _session_key_tail(session_key: str, *, agent_id: str) -> str:
+    key = (session_key or "").strip()
+    prefix = f"agent:{agent_id}:"
+    if key.startswith(prefix):
+        return key[len(prefix) :]
+    return key
+
+
+def _channel_label_collision_maps(
+    label_map: Dict[str, str],
+    sessions: List["SessionView"],
+) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str, str], int]]:
+    label_counts: Dict[Tuple[str, str], int] = {}
+    label_account_counts: Dict[Tuple[str, str, str], int] = {}
+    for sv in sessions:
+        info = parse_session_key(sv.meta.key)
+        if info.kind != "channel":
+            continue
+        lbl = session_display_label(label_map, sv.meta)
+        raw_tail = _session_key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
+        if not lbl or lbl == raw_tail:
+            continue
+        chan = (sv.meta.channel or info.channel or "").strip() or "-"
+        acct = (sv.meta.account_id or "").strip()
+        label_counts[(chan, lbl)] = label_counts.get((chan, lbl), 0) + 1
+        label_account_counts[(chan, lbl, acct)] = label_account_counts.get((chan, lbl, acct), 0) + 1
+    return label_counts, label_account_counts
+
+
+def _channel_session_display_label(
+    label_map: Dict[str, str],
+    meta: SessionMeta,
+    *,
+    label_counts: Optional[Dict[Tuple[str, str], int]] = None,
+    label_account_counts: Optional[Dict[Tuple[str, str, str], int]] = None,
+) -> Optional[str]:
+    lbl = session_display_label(label_map, meta)
+    raw_tail = _session_key_tail(meta.key, agent_id=(meta.agent_id or "-"))
+    if not lbl:
+        return None
+    if lbl == raw_tail:
+        return lbl
+
+    chan = (meta.channel or "").strip() or "-"
+    acct = (meta.account_id or "").strip()
+    if label_counts and label_counts.get((chan, lbl), 0) > 1:
+        acct_hint = _compact_hint(acct, width=10)
+        if acct_hint and label_account_counts and label_account_counts.get((chan, lbl, acct), 0) == 1:
+            return f"{lbl}@{acct_hint}"
+        sid_hint = _tail_suffix(meta.session_id or meta.key, n=4)
+        if acct_hint and sid_hint:
+            return f"{lbl}@{acct_hint}({sid_hint})"
+        if sid_hint:
+            return f"{lbl}({sid_hint})"
+    return lbl
+
+
+def _missing_message_lines(
+    kind: str,
+    *,
+    transcript_missing: bool,
+    proxy_at: Optional[datetime],
+    updated_at: Optional[datetime],
+) -> List[str]:
+    if not transcript_missing:
+        return ["-"]
+    source = "channel inbound only" if kind == "user" else "channel outbound only"
+    if proxy_at:
+        return [f"proxy @ {_fmt_dt(proxy_at)}", source, "payload unavailable"]
+    lines = ["unavailable", "transcript missing"]
+    if updated_at:
+        lines.append(f"session @ {_fmt_dt(updated_at)}")
+    return lines
+
+
 def _cell_width(ch: str) -> int:
     if not ch:
         return 0
@@ -478,8 +564,10 @@ class SessionView:
     telegram_binding: Optional[TelegramThreadBinding]
     telegram_routed_elsewhere: bool
     # Lightweight "silent gap" metrics:
+    # - channel_in_at: last inbound timestamp from channels.status, if available
     # - human_out_at: last human-visible outbound send time (channel-level)
     # - internal_activity_at: last internal activity timestamp from transcript tail (assistant/tool/non-message)
+    channel_in_at: Optional[datetime]
     human_out_at: Optional[datetime]
     internal_activity_at: Optional[datetime]
 
@@ -802,6 +890,7 @@ class MonitorModel:
                     telegram_routed_elsewhere = True
 
             acct_info = _channel_account_info(self.channels, channel=meta.channel, account_id=meta.account_id)
+            in_at = _dt_from_ms(int(acct_info.get("lastInboundAt")) if isinstance(acct_info, dict) and isinstance(acct_info.get("lastInboundAt"), int) else None)
             out_at = _dt_from_ms(int(acct_info.get("lastOutboundAt")) if isinstance(acct_info, dict) and isinstance(acct_info.get("lastOutboundAt"), int) else None)
             internal_at = _internal_activity_at(tail)
             views.append(
@@ -818,6 +907,7 @@ class MonitorModel:
                     transcript_missing=transcript_missing,
                     telegram_binding=telegram_binding,
                     telegram_routed_elsewhere=telegram_routed_elsewhere,
+                    channel_in_at=in_at,
                     human_out_at=out_at,
                     internal_activity_at=internal_at,
                 )
@@ -1368,11 +1458,7 @@ class ClawMonitorTUI:
         return 1
 
     def _key_tail(self, session_key: str, *, agent_id: str) -> str:
-        key = (session_key or "").strip()
-        prefix = f"agent:{agent_id}:"
-        if key.startswith(prefix):
-            return key[len(prefix) :]
-        return key
+        return _session_key_tail(session_key, agent_id=agent_id)
 
     def _node_label_for(self, sv: "SessionView") -> str:
         info = parse_session_key(sv.meta.key)
@@ -1390,7 +1476,13 @@ class ClawMonitorTUI:
             return f"acp:{st}" if st else "acp"
         return info.kind
 
-    def _display_key_tail(self, sv: "SessionView") -> str:
+    def _display_key_tail(
+        self,
+        sv: "SessionView",
+        *,
+        label_counts: Optional[Dict[Tuple[str, str], int]] = None,
+        label_account_counts: Optional[Dict[Tuple[str, str, str], int]] = None,
+    ) -> str:
         info = parse_session_key(sv.meta.key)
         if info.kind == "cron":
             job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
@@ -1404,17 +1496,18 @@ class ClawMonitorTUI:
                 return f"run:{parts[5]}"
         # For channel sessions, prefer a human label if configured.
         if info.kind == "channel":
-            raw_tail = self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
-            lbl = session_display_label(self.cfg.labels, sv.meta)
-            if lbl and lbl != raw_tail:
-                # Disambiguate if multiple sessions share the same label.
-                suf = _tail_suffix(sv.meta.key, n=4)
-                return f"{lbl}({suf})" if suf else lbl
+            lbl = _channel_session_display_label(
+                self.cfg.labels,
+                sv.meta,
+                label_counts=label_counts,
+                label_account_counts=label_account_counts,
+            )
             if lbl:
                 return lbl
         return self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
 
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
+        label_counts, label_account_counts = _channel_label_collision_maps(self.cfg.labels, sessions)
         if not self.tree_view:
             return [
                 _ListSession(
@@ -1466,7 +1559,11 @@ class ClawMonitorTUI:
                         sv=sv,
                         indent_units=self._indent_units_for(sv.meta.key),
                         node_label=self._node_label_for(sv),
-                        key_tail=self._display_key_tail(sv),
+                        key_tail=self._display_key_tail(
+                            sv,
+                            label_counts=label_counts,
+                            label_account_counts=label_account_counts,
+                        ),
                     )
                 )
             if self.show_cron and cron_count:
@@ -3127,12 +3224,9 @@ class ClawMonitorTUI:
             if self.node_show_session_label:
                 info = parse_session_key(sv.meta.key)
                 if info.kind == "channel":
-                    lbl = session_display_label(self.cfg.labels, sv.meta)
+                    lbl = it.key_tail
                     if lbl:
-                        suf = _tail_suffix(sv.meta.key, n=4)
-                        # Keep NODE readable even with repeated labels across old sessions.
-                        lbl2 = f"{lbl}({suf})" if suf else lbl
-                        node_leaf = f"{it.node_label}:{lbl2}"
+                        node_leaf = f"{it.node_label}:{lbl}"
             node_text = f"{indent}- {node_leaf}"
             selected = (idx == self.selected)
             row_attr = self._row_attr(health_cls, selected=selected)
@@ -3896,6 +3990,12 @@ class ClawMonitorTUI:
             lines.append(f"Last User Send @ {_fmt_dt(sv.tail.last_user_send.ts)}")
             for part in _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, w - 2), max_lines=3):
                 lines.append(f"  {part}")
+        elif sv.transcript_missing:
+            lines.append("Last User Send: unavailable (transcript missing)")
+            if sv.channel_in_at:
+                lines.append(f"  Proxy inbound @ {_fmt_dt(sv.channel_in_at)}")
+            elif sv.updated_at:
+                lines.append(f"  Session updated @ {_fmt_dt(sv.updated_at)}")
         else:
             lines.append("Last User Send: -")
         lines.append("")
@@ -3903,6 +4003,12 @@ class ClawMonitorTUI:
             lines.append(f"Last ASST @ {_fmt_dt(sv.tail.last_assistant.ts)}  stopReason={sv.tail.last_assistant.stop_reason or '-'}")
             for part in _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w - 2), max_lines=4):
                 lines.append(f"  {part}")
+        elif sv.transcript_missing:
+            lines.append("Last ASST: unavailable (transcript missing)")
+            if sv.human_out_at:
+                lines.append(f"  Proxy outbound @ {_fmt_dt(sv.human_out_at)}")
+            elif sv.updated_at:
+                lines.append(f"  Session updated @ {_fmt_dt(sv.updated_at)}")
         else:
             lines.append("Last ASST: -")
         lines.append("")
@@ -3915,6 +4021,39 @@ class ClawMonitorTUI:
 
         for i in range(min(h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
+
+    def _user_message_lines(self, sv: SessionView, *, width: int, max_lines: int) -> List[str]:
+        if sv.tail.last_user_send:
+            return [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(
+                redact_text(sv.tail.last_user_send.preview),
+                max(0, width),
+                max_lines=max(0, max_lines - 2),
+            )
+        return _missing_message_lines(
+            "user",
+            transcript_missing=sv.transcript_missing,
+            proxy_at=sv.channel_in_at,
+            updated_at=sv.updated_at,
+        )[:max_lines]
+
+    def _claw_message_lines(self, sv: SessionView, *, width: int, max_lines: int) -> List[str]:
+        if sv.tail.last_assistant:
+            model = sv.tail.last_assistant.model or "-"
+            provider = sv.tail.last_assistant.provider or "-"
+            head = f"stop={sv.tail.last_assistant.stop_reason or '-'}"
+            if model != "-" or provider != "-":
+                head = f"{head}  model={provider}/{model}"
+            return [f"@ {_fmt_dt(sv.tail.last_assistant.ts)}", head, ""] + _wrap_lines(
+                redact_text(sv.tail.last_assistant.preview),
+                max(0, width),
+                max_lines=max(0, max_lines - 3),
+            )
+        return _missing_message_lines(
+            "claw",
+            transcript_missing=sv.transcript_missing,
+            proxy_at=sv.human_out_at,
+            updated_at=sv.updated_at,
+        )[:max_lines]
 
     def _draw_details_status_split3(
         self,
@@ -3979,18 +4118,8 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, y_msgs, x3, _fit("Last Trigger", col3), col3, trig_attr)
 
         # Body lines
-        user_lines: List[str] = ["-"]
-        if sv.tail.last_user_send:
-            user_lines = [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, col1), max_lines=msg_h - 2)
-        claw_lines: List[str] = ["-"]
-        if sv.tail.last_assistant:
-            model = sv.tail.last_assistant.model or "-"
-            provider = sv.tail.last_assistant.provider or "-"
-            claw_lines = [
-                f"@ {_fmt_dt(sv.tail.last_assistant.ts)}",
-                f"stop={sv.tail.last_assistant.stop_reason or '-'}  model={provider}/{model}" if (model != "-" or provider != "-") else f"stop={sv.tail.last_assistant.stop_reason or '-'}",
-                "",
-            ] + _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col2), max_lines=msg_h - 3)
+        user_lines = self._user_message_lines(sv, width=col1, max_lines=max(1, msg_h - 1))
+        claw_lines = self._claw_message_lines(sv, width=col2, max_lines=max(1, msg_h - 1))
         trig_lines: List[str] = ["-"]
         if sv.tail.last_trigger:
             trig_lines = [f"@ {_fmt_dt(sv.tail.last_trigger.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_trigger.preview), max(0, col3), max_lines=msg_h - 2)
@@ -4052,32 +4181,15 @@ class ClawMonitorTUI:
 
         # Last User Send
         self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
-        if sv.tail.last_user_send:
-            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", w), w)
-            msg_lines = _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, w), max_lines=max(0, user_h - 2))
-            for i, ln in enumerate(msg_lines[: max(0, user_h - 2)]):
-                self._safe_addnstr(stdscr, y_user + 2 + i, x, _fit(ln, w), w)
-        else:
-            self._safe_addnstr(stdscr, y_user + 1, x, _fit("-", w), w)
+        user_lines = self._user_message_lines(sv, width=w, max_lines=max(1, user_h - 1))
+        for i, ln in enumerate(user_lines[: max(0, user_h - 1)]):
+            self._safe_addnstr(stdscr, y_user + 1 + i, x, _fit(ln, w), w)
 
         # Last Claw Send
         self._safe_addnstr(stdscr, y_claw, x, _fit("Last Claw Send", w), w, claw_attr)
-        if sv.tail.last_assistant:
-            model = sv.tail.last_assistant.model or "-"
-            provider = sv.tail.last_assistant.provider or "-"
-            model_str = f"  model={provider}/{model}" if (model != "-" or provider != "-") else ""
-            self._safe_addnstr(
-                stdscr,
-                y_claw + 1,
-                x,
-                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}{model_str}", w),
-                w,
-            )
-            msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, claw_h - 2))
-            for i, ln in enumerate(msg_lines[: max(0, claw_h - 2)]):
-                self._safe_addnstr(stdscr, y_claw + 2 + i, x, _fit(ln, w), w)
-        else:
-            self._safe_addnstr(stdscr, y_claw + 1, x, _fit("-", w), w)
+        claw_lines = self._claw_message_lines(sv, width=w, max_lines=max(1, claw_h - 1))
+        for i, ln in enumerate(claw_lines[: max(0, claw_h - 1)]):
+            self._safe_addnstr(stdscr, y_claw + 1 + i, x, _fit(ln, w), w)
 
         # Last Trigger
         self._safe_addnstr(stdscr, y_trig, x, _fit("Last Trigger", w), w, trig_attr)
