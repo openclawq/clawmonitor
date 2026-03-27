@@ -22,6 +22,8 @@ from .session_tail import tail_for_meta
 
 
 DEFAULT_MODEL_PROBE_PROMPT = "Reply with exactly OK."
+_ENV_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$")
+_ENV_FILE_CACHE: Dict[Path, Dict[str, str]] = {}
 
 
 def _utc_now() -> datetime:
@@ -274,7 +276,7 @@ def _extract_model_chain(model_cfg: Any) -> List[Tuple[str, str]]:
     return out
 
 
-def _normalize_headers(headers: Any) -> Dict[str, str]:
+def _normalize_headers(headers: Any, *, agent_dir: Optional[Path] = None) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if not isinstance(headers, dict):
         return out
@@ -283,26 +285,80 @@ def _normalize_headers(headers: Any) -> Dict[str, str]:
             continue
         if not isinstance(value, str):
             continue
-        resolved = _resolve_secret(value)[0] or value
+        resolved = _resolve_secret(value, agent_dir=agent_dir)[0] or value
         out[key.strip()] = resolved
     return out
 
 
-def _resolve_secret(value: Any) -> Tuple[Optional[str], Optional[str]]:
+def _find_openclaw_root(agent_dir: Optional[Path]) -> Optional[Path]:
+    if agent_dir is None:
+        return None
+    start = agent_dir.expanduser().resolve()
+    for candidate in (start, *start.parents):
+        if (candidate / "openclaw.json").exists():
+            return candidate
+    return None
+
+
+def _strip_env_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _load_openclaw_env(root: Optional[Path]) -> Dict[str, str]:
+    if root is None:
+        return {}
+    env_path = root / ".env"
+    cached = _ENV_FILE_CACHE.get(env_path)
+    if cached is not None:
+        return cached
+    parsed: Dict[str, str] = {}
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = _ENV_ASSIGN_RE.match(line)
+            if not match:
+                continue
+            parsed[match.group(1)] = _strip_env_value(match.group(2))
+    except Exception:
+        parsed = {}
+    _ENV_FILE_CACHE[env_path] = parsed
+    return parsed
+
+
+def _resolve_env_value(env_name: str, *, agent_dir: Optional[Path] = None) -> Optional[str]:
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    root = _find_openclaw_root(agent_dir)
+    if root is None:
+        return None
+    return _load_openclaw_env(root).get(env_name)
+
+
+def _resolve_secret(value: Any, *, agent_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(value, str):
         return None, None
     raw = value.strip()
     if not raw:
         return None, None
     lowered = raw.lower()
+    braced_env = re.fullmatch(r"\$\{([A-Z][A-Z0-9_]*)\}", raw)
+    if braced_env:
+        env_name = braced_env.group(1)
+        return _resolve_env_value(env_name, agent_dir=agent_dir), f"env:{env_name}"
     if lowered.startswith("secretref-env:"):
         env_name = raw.split(":", 1)[1].strip()
-        return os.environ.get(env_name), f"env:{env_name}"
+        return _resolve_env_value(env_name, agent_dir=agent_dir), f"env:{env_name}"
     if lowered.startswith("env:"):
         env_name = raw.split(":", 1)[1].strip()
-        return os.environ.get(env_name), f"env:{env_name}"
+        return _resolve_env_value(env_name, agent_dir=agent_dir), f"env:{env_name}"
     if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", raw):
-        return os.environ.get(raw), f"env:{raw}"
+        return _resolve_env_value(raw, agent_dir=agent_dir), f"env:{raw}"
     return raw, "literal"
 
 
@@ -339,7 +395,7 @@ def _resolve_auth_value(provider_id: str, provider_conf: Dict[str, Any], agent_d
 
     if isinstance(selected_profile, dict):
         for auth_key in ("key", "token", "apiKey", "accessToken", "value"):
-            resolved, source = _resolve_secret(selected_profile.get(auth_key))
+            resolved, source = _resolve_secret(selected_profile.get(auth_key), agent_dir=agent_dir)
             if resolved:
                 src = f"profile:{selected_profile_name}" if selected_profile_name else "profile"
                 if source and source != "literal":
@@ -347,7 +403,7 @@ def _resolve_auth_value(provider_id: str, provider_conf: Dict[str, Any], agent_d
                 return resolved, src
 
     for auth_key in ("apiKey", "token", "key"):
-        resolved, source = _resolve_secret(provider_conf.get(auth_key))
+        resolved, source = _resolve_secret(provider_conf.get(auth_key), agent_dir=agent_dir)
         if resolved:
             src = f"provider:{provider_id}"
             if source and source != "literal":
@@ -414,6 +470,23 @@ def _extract_model_label(model_ref: str, provider_conf: Dict[str, Any], alias_ma
     return model_id
 
 
+def _extract_model_api_kind(model_ref: str, provider_conf: Dict[str, Any]) -> Optional[str]:
+    model_id = model_ref.split("/", 1)[1] if "/" in model_ref else model_ref
+    models = provider_conf.get("models")
+    if not isinstance(models, list):
+        return None
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "").strip() != model_id:
+            continue
+        api = str(item.get("api") or "").strip().lower()
+        if api in ("openai-completions", "openai-responses", "anthropic-messages"):
+            return api
+        return None
+    return None
+
+
 def discover_model_targets(openclaw_root: Path) -> List[ModelTarget]:
     doc = _safe_load_json(openclaw_root / "openclaw.json")
     providers = _get(doc, "models", "providers")
@@ -477,9 +550,11 @@ def discover_model_targets(openclaw_root: Path) -> List[ModelTarget]:
             if not isinstance(provider_conf, dict):
                 provider_conf = {}
             base_url = _provider_base_url(provider_conf)
-            api_kind = _detect_api_kind(provider_conf, base_url=base_url)
+            api_kind = _extract_model_api_kind(model_ref, provider_conf) or _detect_api_kind(
+                provider_conf, base_url=base_url
+            )
             auth_value, auth_source = _resolve_auth_value(provider_id, provider_conf, agent_dir_path)
-            headers = _normalize_headers(provider_conf.get("headers"))
+            headers = _normalize_headers(provider_conf.get("headers"), agent_dir=agent_dir_path)
             if auth_value:
                 headers = _with_auth_headers(headers, provider_conf, api_kind=api_kind, auth_value=auth_value)
             targets.append(
