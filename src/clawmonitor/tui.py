@@ -1041,6 +1041,15 @@ class ClawMonitorTUI:
     def run(self) -> None:
         curses.wrapper(self._main)
 
+    def _related_transcripts_for(self, sv: SessionView) -> List[TranscriptCandidate]:
+        now = time.time()
+        cached = self.model._related_transcript_cache.get(sv.meta.key)
+        if cached and now - cached[0] < 30.0:
+            return list(cached[1])
+        rows = find_related_transcript_candidates(self.cfg.openclaw_root, sv.meta, limit=5, search_limit=80)
+        self.model._related_transcript_cache[sv.meta.key] = (now, rows)
+        return list(rows)
+
     def _set_refresh_progress(self, msg: str, step: int, total: int) -> None:
         with self._refresh_lock:
             self._refresh_progress_msg = msg
