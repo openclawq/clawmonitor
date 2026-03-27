@@ -75,6 +75,7 @@ from .session_usage import SessionUsageRangeEntry, SessionUsageRangeResult, fetc
 from .state import SessionComputed, WorkState, WorkingSignal, compute_state
 from .system_monitor import SystemFamilySummary, SystemSnapshot, collect_system_snapshot
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
+from .transcript_lookup import TranscriptCandidate, find_related_transcript_candidates, resolve_transcript_candidate
 from .transcript_tail import TranscriptTail, tail_transcript
 
 
@@ -561,6 +562,8 @@ class SessionView:
     findings: List[Finding]
     updated_at: Optional[datetime]
     transcript_missing: bool
+    transcript_path: Optional[Path]
+    transcript_source: str
     telegram_binding: Optional[TelegramThreadBinding]
     telegram_routed_elsewhere: bool
     # Lightweight "silent gap" metrics:
@@ -647,6 +650,7 @@ class MonitorModel:
         self._tail_cache: Dict[Path, Tuple[float, int, TranscriptTail]] = {}
         self._acpx_cache: Dict[Path, Tuple[float, int, Optional[AcpxSnapshot], TranscriptTail]] = {}
         self._tail_key_cache: Dict[str, Tuple[Optional[int], Optional[str], float, TranscriptTail]] = {}
+        self._related_transcript_cache: Dict[str, Tuple[float, List[TranscriptCandidate]]] = {}
         self._delivery_map: Dict[str, DeliveryFailure] = {}
         self._delivery_last_load = 0.0
         self._gateway_logs = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
@@ -818,6 +822,15 @@ class MonitorModel:
         self._tail_key_cache[key] = (updated, path_str, now, tail)
         return tail
 
+    def _related_transcripts_for(self, sv: SessionView) -> List[TranscriptCandidate]:
+        now = time.time()
+        cached = self._related_transcript_cache.get(sv.meta.key)
+        if cached and now - cached[0] < 30.0:
+            return list(cached[1])
+        rows = find_related_transcript_candidates(self.cfg.openclaw_root, sv.meta, limit=5, search_limit=80)
+        self._related_transcript_cache[sv.meta.key] = (now, rows)
+        return list(rows)
+
     def _telegram_binding_for(self, *, account_id: Optional[str], to: Optional[str]) -> Optional[TelegramThreadBinding]:
         if not to or not isinstance(to, str) or not to.startswith("telegram:"):
             return None
@@ -859,7 +872,10 @@ class MonitorModel:
             if is_modelprobe_session_key(meta.key) and lock is None:
                 continue
             acpx: Optional[AcpxSnapshot] = None
-            tail = self._tail_for_meta(meta, lock_present=bool(lock))
+            transcript = resolve_transcript_candidate(self.cfg.openclaw_root, meta)
+            transcript_path = transcript.path if transcript else None
+            transcript_source = transcript.source if transcript else "missing"
+            tail = self._tail_for(transcript_path)
             if (not meta.session_file or not meta.session_file.exists()) and meta.acpx_session_id:
                 acpx, tail = self._acpx_tail_for(meta.acpx_session_id)
             df = self._delivery_map.get(meta.key)
@@ -905,6 +921,8 @@ class MonitorModel:
                     findings=findings,
                     updated_at=_dt_from_ms(meta.updated_at_ms),
                     transcript_missing=transcript_missing,
+                    transcript_path=transcript_path,
+                    transcript_source=transcript_source,
                     telegram_binding=telegram_binding,
                     telegram_routed_elsewhere=telegram_routed_elsewhere,
                     channel_in_at=in_at,
@@ -1229,17 +1247,27 @@ class ClawMonitorTUI:
                 self.elog.write("history.load.error", sessionKey=session_key, error=err or "history load failed")
 
     def _request_history_load(self, sv: SessionView) -> None:
-        if not sv.meta.session_file:
+        history_path = sv.transcript_path
+        history_session_id = sv.meta.session_id
+        history_note = "Reading transcript and updating history cache..."
+        if history_path is None:
+            related = self._related_transcripts_for(sv)
+            if related:
+                chosen = related[0]
+                history_path = chosen.path
+                history_session_id = chosen.session_id_hint or sv.meta.session_id
+                history_note = f"Reading related transcript archive ({chosen.path.name})..."
+        if history_path is None:
             with self._history_lock:
                 self._history_states[sv.meta.key] = _HistoryPaneState(
                     load_state="error",
                     result=None,
-                    error="session has no transcript file",
+                    error="session has no readable transcript file",
                     progress_msg="",
                     started_at=None,
                     last_loaded_at=None,
                 )
-            self.elog.write("history.load.error", sessionKey=sv.meta.key, error="session has no transcript file")
+            self.elog.write("history.load.error", sessionKey=sv.meta.key, error="session has no readable transcript file")
             return
         with self._history_lock:
             cur = self._history_states.get(sv.meta.key)
@@ -1249,15 +1277,15 @@ class ClawMonitorTUI:
                 load_state="loading",
                 result=cur.result if cur else None,
                 error=None,
-                progress_msg="Reading transcript and updating history cache...",
+                progress_msg=history_note,
                 started_at=time.time(),
                 last_loaded_at=cur.last_loaded_at if cur else None,
             )
-        self.elog.write("history.load.requested", sessionKey=sv.meta.key, sessionId=sv.meta.session_id)
+        self.elog.write("history.load.requested", sessionKey=sv.meta.key, sessionId=history_session_id, sessionFile=str(history_path))
         t = threading.Thread(
             target=self._history_worker,
-            args=(sv.meta.key, sv.meta.session_id, sv.meta.session_file),
-            name=f"clawmonitor-history-{sv.meta.session_id[:8]}",
+            args=(sv.meta.key, history_session_id, history_path),
+            name=f"clawmonitor-history-{history_session_id[:8]}",
             daemon=True,
         )
         t.start()
@@ -2187,6 +2215,14 @@ class ClawMonitorTUI:
         last_activity: Optional[str],
         width: int,
     ) -> List[str]:
+        transcript_summary = "MISSING"
+        if sv.transcript_path:
+            if sv.transcript_source == "live":
+                transcript_summary = "OK"
+            elif sv.transcript_source == "derived":
+                transcript_summary = "OK (derived)"
+            else:
+                transcript_summary = f"ARCHIVE ({sv.transcript_source})"
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
         key_info = parse_session_key(sv.meta.key)
@@ -2195,12 +2231,22 @@ class ClawMonitorTUI:
             f"SessionKey: {sv.meta.key}",
             f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {self._channel_surface_label(sv.meta.channel)}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
-            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
+            f"Transcript: {transcript_summary}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
         target_line = self._target_display_text(sv.meta)
         if target_line:
             status_lines.insert(2, target_line)
+        if sv.meta.session_file and sv.transcript_path and sv.transcript_path != sv.meta.session_file:
+            status_lines.insert(4, f"TranscriptPath: {sv.transcript_path.name}  (pointer missing: {sv.meta.session_file.name})")
+        elif sv.meta.session_file and sv.transcript_missing:
+            status_lines.insert(4, f"TranscriptPath: missing pointer -> {sv.meta.session_file.name}")
+        if sv.transcript_missing and not sv.transcript_path:
+            related = self._related_transcripts_for(sv)
+            if related:
+                status_lines.insert(5, f"RelatedTranscript: {related[0].path.name}  (+{max(0, len(related) - 1)} more)")
+            else:
+                status_lines.insert(5, "RelatedTranscript: none found")
         status_lines.extend(self._session_usage_lines(sv))
         status_lines.extend(self._session_range_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
@@ -3727,10 +3773,18 @@ class ClawMonitorTUI:
         if self.detail_fullscreen:
             status_line += "  |  FULLSCREEN DETAIL ACTIVE"
         self._safe_addnstr(stdscr, y + 1, x, _fit(status_line, w), w, curses.A_BOLD)
-        path_text = str(sv.meta.session_file) if sv.meta.session_file else "-"
+        path_text = str(sv.transcript_path) if sv.transcript_path else (str(sv.meta.session_file) if sv.meta.session_file else "-")
         self._safe_addnstr(stdscr, y + 2, x, _fit(f"Session: {sv.meta.key}", w), w)
         self._safe_addnstr(stdscr, y + 3, x, _fit(f"Transcript: {path_text}", w), w)
         source_line = "Derived from transcript | best-effort"
+        if sv.transcript_path and sv.transcript_source not in ("live", "derived"):
+            source_line += f" | archive={sv.transcript_source}"
+        elif sv.transcript_missing:
+            related = self._related_transcripts_for(sv)
+            if related:
+                source_line += f" | fallback={related[0].path.name}"
+            else:
+                source_line += " | no archive fallback found"
         if live_now:
             source_line += " | LIVE TASK HISTORY"
         elif stale:
@@ -3743,11 +3797,15 @@ class ClawMonitorTUI:
             return
 
         if state.load_state == "not_loaded" and result is None:
+            related = self._related_transcripts_for(sv) if sv.transcript_missing and not sv.transcript_path else []
+            prompt = "HISTORY LIST | No history loaded yet. Press [r] to read this session transcript."
+            if related:
+                prompt = f"HISTORY LIST | Press [r] to read fallback archive {related[0].path.name}."
             self._safe_addnstr(
                 stdscr,
                 body_y,
                 x,
-                _fit("HISTORY LIST | No history loaded yet. Press [r] to read this session transcript.", w),
+                _fit(prompt, w),
                 w,
                 curses.A_BOLD | (self._color_idle if self._colors_enabled else 0),
             )
@@ -3961,11 +4019,13 @@ class ClawMonitorTUI:
         if sv.meta.kind or sv.meta.chat_type:
             lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
         lines.append(f"UpdatedAt: {_fmt_dt(sv.updated_at)}")
-        if sv.meta.session_file:
-            if sv.transcript_missing:
-                lines.append(f"Transcript: MISSING ({sv.meta.session_file})")
+        if sv.transcript_path:
+            if sv.transcript_source in ("reset", "deleted"):
+                lines.append(f"Transcript: ARCHIVE/{sv.transcript_source} ({sv.transcript_path})")
             else:
-                lines.append(f"Transcript: {sv.meta.session_file}")
+                lines.append(f"Transcript: {sv.transcript_path}")
+        elif sv.meta.session_file:
+            lines.append(f"Transcript: MISSING ({sv.meta.session_file})")
         if sv.telegram_binding:
             b = sv.telegram_binding
             note = ""
