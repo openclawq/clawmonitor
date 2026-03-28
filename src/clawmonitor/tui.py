@@ -350,6 +350,25 @@ def _missing_message_lines(
     return lines
 
 
+def _message_preview_lines(
+    *,
+    ts: Optional[datetime],
+    preview: str,
+    width: int,
+    max_lines: int,
+    prefix_lines: Optional[List[str]] = None,
+) -> List[str]:
+    lines: List[str] = [f"@ {_fmt_dt(ts)}"]
+    for extra in prefix_lines or []:
+        if extra:
+            lines.append(extra)
+    remaining = max_lines - len(lines)
+    if remaining <= 0:
+        return lines[:max_lines]
+    wrapped = _wrap_lines(redact_text(preview), max(0, width), max_lines=remaining)
+    return lines + wrapped
+
+
 def _cell_width(ch: str) -> int:
     if not ch:
         return 0
@@ -4093,10 +4112,11 @@ class ClawMonitorTUI:
 
     def _user_message_lines(self, sv: SessionView, *, width: int, max_lines: int) -> List[str]:
         if sv.tail.last_user_send:
-            return [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(
-                redact_text(sv.tail.last_user_send.preview),
-                max(0, width),
-                max_lines=max(0, max_lines - 2),
+            return _message_preview_lines(
+                ts=sv.tail.last_user_send.ts,
+                preview=sv.tail.last_user_send.preview,
+                width=width,
+                max_lines=max_lines,
             )
         return _missing_message_lines(
             "user",
@@ -4112,10 +4132,12 @@ class ClawMonitorTUI:
             head = f"stop={sv.tail.last_assistant.stop_reason or '-'}"
             if model != "-" or provider != "-":
                 head = f"{head}  model={provider}/{model}"
-            return [f"@ {_fmt_dt(sv.tail.last_assistant.ts)}", head, ""] + _wrap_lines(
-                redact_text(sv.tail.last_assistant.preview),
-                max(0, width),
-                max_lines=max(0, max_lines - 3),
+            return _message_preview_lines(
+                ts=sv.tail.last_assistant.ts,
+                preview=sv.tail.last_assistant.preview,
+                width=width,
+                max_lines=max_lines,
+                prefix_lines=[head],
             )
         return _missing_message_lines(
             "claw",
@@ -4191,7 +4213,12 @@ class ClawMonitorTUI:
         claw_lines = self._claw_message_lines(sv, width=col2, max_lines=max(1, msg_h - 1))
         trig_lines: List[str] = ["-"]
         if sv.tail.last_trigger:
-            trig_lines = [f"@ {_fmt_dt(sv.tail.last_trigger.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_trigger.preview), max(0, col3), max_lines=msg_h - 2)
+            trig_lines = _message_preview_lines(
+                ts=sv.tail.last_trigger.ts,
+                preview=sv.tail.last_trigger.preview,
+                width=col3,
+                max_lines=max(1, msg_h - 1),
+            )
 
         body_h = msg_h - 1
         for i in range(min(body_h, len(user_lines))):
@@ -4263,10 +4290,14 @@ class ClawMonitorTUI:
         # Last Trigger
         self._safe_addnstr(stdscr, y_trig, x, _fit("Last Trigger", w), w, trig_attr)
         if sv.tail.last_trigger:
-            self._safe_addnstr(stdscr, y_trig + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_trigger.ts)}", w), w)
-            msg_lines = _wrap_lines(redact_text(sv.tail.last_trigger.preview), max(0, w), max_lines=max(0, trig_h - 2))
-            for i, ln in enumerate(msg_lines[: max(0, trig_h - 2)]):
-                self._safe_addnstr(stdscr, y_trig + 2 + i, x, _fit(ln, w), w)
+            trig_lines = _message_preview_lines(
+                ts=sv.tail.last_trigger.ts,
+                preview=sv.tail.last_trigger.preview,
+                width=w,
+                max_lines=max(1, trig_h - 1),
+            )
+            for i, ln in enumerate(trig_lines[: max(0, trig_h - 1)]):
+                self._safe_addnstr(stdscr, y_trig + 1 + i, x, _fit(ln, w), w)
         else:
             self._safe_addnstr(stdscr, y_trig + 1, x, _fit("-", w), w)
 

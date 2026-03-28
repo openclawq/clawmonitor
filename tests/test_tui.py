@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from clawmonitor.session_store import SessionMeta
-from clawmonitor.tui import _channel_session_display_label, _missing_message_lines
+from clawmonitor.tui import _channel_session_display_label, _message_preview_lines, _missing_message_lines
 
 
 def _session_meta(*, key: str, session_id: str, account_id: str, to: str) -> SessionMeta:
@@ -81,4 +81,20 @@ def test_missing_message_lines_uses_session_updated_when_no_proxy() -> None:
         "unavailable",
         "transcript missing",
         "session @ 2026-03-27 09:02:03",
+    ]
+
+
+def test_message_preview_lines_uses_second_line_for_preview_when_height_is_tight() -> None:
+    ts = datetime(2026, 3, 16, 7, 24, 22, tzinfo=timezone.utc)
+
+    lines = _message_preview_lines(
+        ts=ts,
+        preview="Actual user message",
+        width=30,
+        max_lines=2,
+    )
+
+    assert lines == [
+        "@ 2026-03-16 15:24:22",
+        "Actual user message",
     ]
