@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from clawmonitor.session_store import SessionMeta
-from clawmonitor.tui import _channel_session_display_label, _message_preview_lines, _missing_message_lines
+from clawmonitor.tui import _channel_session_display_label, _message_pane_title, _message_preview_lines, _missing_message_lines
 
 
 def _session_meta(*, key: str, session_id: str, account_id: str, to: str) -> SessionMeta:
@@ -98,3 +98,9 @@ def test_message_preview_lines_uses_second_line_for_preview_when_height_is_tight
         "@ 2026-03-16 15:24:22",
         "Actual user message",
     ]
+
+
+def test_message_pane_title_marks_compact_mode_when_body_is_tight() -> None:
+    assert _message_pane_title("Last User Send", width=40, body_lines=2) == "Last User Send [compact]"
+    assert _message_pane_title("Last User Send", width=15, body_lines=2) == "Last User Send*"
+    assert _message_pane_title("Last User Send", width=40, body_lines=3) == "Last User Send"

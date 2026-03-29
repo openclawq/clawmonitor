@@ -369,6 +369,16 @@ def _message_preview_lines(
     return lines + wrapped
 
 
+def _message_pane_title(title: str, *, width: int, body_lines: int) -> str:
+    if body_lines > 2:
+        return title
+    if width >= len(title) + len(" [compact]"):
+        return f"{title} [compact]"
+    if width >= len(title) + 1:
+        return f"{title}*"
+    return title
+
+
 def _cell_width(ch: str) -> int:
     if not ch:
         return 0
@@ -4204,9 +4214,31 @@ class ClawMonitorTUI:
         except curses.error:
             pass
 
-        self._safe_addnstr(stdscr, y_msgs, x1, _fit("Last User Send", col1), col1, user_attr)
-        self._safe_addnstr(stdscr, y_msgs, x2, _fit("Last Claw Send", col2), col2, claw_attr)
-        self._safe_addnstr(stdscr, y_msgs, x3, _fit("Last Trigger", col3), col3, trig_attr)
+        body_h = msg_h - 1
+        self._safe_addnstr(
+            stdscr,
+            y_msgs,
+            x1,
+            _fit(_message_pane_title("Last User Send", width=col1, body_lines=body_h), col1),
+            col1,
+            user_attr,
+        )
+        self._safe_addnstr(
+            stdscr,
+            y_msgs,
+            x2,
+            _fit(_message_pane_title("Last Claw Send", width=col2, body_lines=body_h), col2),
+            col2,
+            claw_attr,
+        )
+        self._safe_addnstr(
+            stdscr,
+            y_msgs,
+            x3,
+            _fit(_message_pane_title("Last Trigger", width=col3, body_lines=body_h), col3),
+            col3,
+            trig_attr,
+        )
 
         # Body lines
         user_lines = self._user_message_lines(sv, width=col1, max_lines=max(1, msg_h - 1))
@@ -4220,7 +4252,6 @@ class ClawMonitorTUI:
                 max_lines=max(1, msg_h - 1),
             )
 
-        body_h = msg_h - 1
         for i in range(min(body_h, len(user_lines))):
             self._safe_addnstr(stdscr, y_msgs + 1 + i, x1, _fit(user_lines[i], col1), col1)
         for i in range(min(body_h, len(claw_lines))):
@@ -4276,25 +4307,49 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, self._session_status_line_attr(ln))
 
         # Last User Send
-        self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
-        user_lines = self._user_message_lines(sv, width=w, max_lines=max(1, user_h - 1))
+        user_body_h = max(0, user_h - 1)
+        claw_body_h = max(0, claw_h - 1)
+        trig_body_h = max(0, trig_h - 1)
+        self._safe_addnstr(
+            stdscr,
+            y_user,
+            x,
+            _fit(_message_pane_title("Last User Send", width=w, body_lines=user_body_h), w),
+            w,
+            user_attr,
+        )
+        user_lines = self._user_message_lines(sv, width=w, max_lines=max(1, user_body_h))
         for i, ln in enumerate(user_lines[: max(0, user_h - 1)]):
             self._safe_addnstr(stdscr, y_user + 1 + i, x, _fit(ln, w), w)
 
         # Last Claw Send
-        self._safe_addnstr(stdscr, y_claw, x, _fit("Last Claw Send", w), w, claw_attr)
-        claw_lines = self._claw_message_lines(sv, width=w, max_lines=max(1, claw_h - 1))
+        self._safe_addnstr(
+            stdscr,
+            y_claw,
+            x,
+            _fit(_message_pane_title("Last Claw Send", width=w, body_lines=claw_body_h), w),
+            w,
+            claw_attr,
+        )
+        claw_lines = self._claw_message_lines(sv, width=w, max_lines=max(1, claw_body_h))
         for i, ln in enumerate(claw_lines[: max(0, claw_h - 1)]):
             self._safe_addnstr(stdscr, y_claw + 1 + i, x, _fit(ln, w), w)
 
         # Last Trigger
-        self._safe_addnstr(stdscr, y_trig, x, _fit("Last Trigger", w), w, trig_attr)
+        self._safe_addnstr(
+            stdscr,
+            y_trig,
+            x,
+            _fit(_message_pane_title("Last Trigger", width=w, body_lines=trig_body_h), w),
+            w,
+            trig_attr,
+        )
         if sv.tail.last_trigger:
             trig_lines = _message_preview_lines(
                 ts=sv.tail.last_trigger.ts,
                 preview=sv.tail.last_trigger.preview,
                 width=w,
-                max_lines=max(1, trig_h - 1),
+                max_lines=max(1, trig_body_h),
             )
             for i, ln in enumerate(trig_lines[: max(0, trig_h - 1)]):
                 self._safe_addnstr(stdscr, y_trig + 1 + i, x, _fit(ln, w), w)
