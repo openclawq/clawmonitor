@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Model monitor: resolve provider auth/header secrets from `${VAR}` syntax and fall back to `~/.openclaw/.env` when process env vars are missing.
+- Model monitor: prefer model-level `models[].api` declarations over provider/base URL heuristics so mixed transports probe with the correct API kind.
+- Tests: add regression coverage for dotenv-backed auth resolution and model-level OpenAI Responses targets.
+
 ## 0.2.0
 
 - Product scope: ClawMonitor is now a broader OpenClaw operations monitor, covering Session, Model, Token, and System views in one keyboard-first TUI.
